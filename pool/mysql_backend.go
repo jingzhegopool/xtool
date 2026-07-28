@@ -1,10 +1,11 @@
-﻿package pool
+package pool
 
 import (
 	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
@@ -43,6 +44,7 @@ func (b *mysqlBackend) Init(ctx context.Context) error {
 	db.SetConnMaxLifetime(5 * time.Minute)
 
 	if err := db.PingContext(ctx); err != nil {
+		poolLogger().Error("MySQL 连接测试失败", slog.String("error", err.Error()))
 		return fmt.Errorf("pool/mysql: 连接测试失败: %w", err)
 	}
 
@@ -72,15 +74,21 @@ func (b *mysqlBackend) Init(ctx context.Context) error {
 		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
 	`)
 	if err != nil {
+		poolLogger().Error("MySQL 创建表失败", slog.String("error", err.Error()))
 		return fmt.Errorf("pool/mysql: 创建表失败: %w", err)
 	}
+	poolLogger().Info("MySQL 后端初始化完成")
 	return nil
 }
 
 func (b *mysqlBackend) Close() error {
 	if b.db != nil {
-		return b.db.Close()
+		if err := b.db.Close(); err != nil {
+			poolLogger().Error("MySQL 后端关闭失败", slog.String("error", err.Error()))
+			return err
+		}
 	}
+	poolLogger().Info("MySQL 后端已关闭")
 	return nil
 }
 
@@ -100,7 +108,19 @@ func (b *mysqlBackend) Save(task *Task) error {
 		nullTime(task.ScheduledAt), task.CreatedAt, task.Error,
 		task.ProgressCurrent, task.ProgressTotal, string(task.Metadata),
 	)
-	return err
+	if err != nil {
+		poolLogger().Error("MySQL 保存任务失败",
+			slog.String("id", task.ID),
+			slog.String("type", task.Type),
+			slog.String("error", err.Error()),
+		)
+		return err
+	}
+	poolLogger().Debug("MySQL 保存任务",
+		slog.String("id", task.ID),
+		slog.String("type", task.Type),
+	)
+	return nil
 }
 
 func nullTime(t time.Time) *time.Time {
@@ -125,6 +145,10 @@ func (b *mysqlBackend) Delete(id string) error {
 func (b *mysqlBackend) Enqueue(task *Task) error {
 	existing, err := b.Get(task.ID)
 	if err != nil && err != ErrTaskNotFound {
+		poolLogger().Error("MySQL 入队前查询失败",
+			slog.String("id", task.ID),
+			slog.String("error", err.Error()),
+		)
 		return err
 	}
 	if existing != nil {
@@ -132,14 +156,27 @@ func (b *mysqlBackend) Enqueue(task *Task) error {
 			`UPDATE taskpool_tasks SET status=?, priority=?, scheduled_at=? WHERE id=?`,
 			task.Status, task.Priority, nullTime(task.ScheduledAt), task.ID,
 		)
-		if err == nil {
-			b.wakeUp()
+		if err != nil {
+			poolLogger().Error("MySQL 更新任务入队失败",
+				slog.String("id", task.ID),
+				slog.String("error", err.Error()),
+			)
+			return err
 		}
-		return err
+		poolLogger().Debug("MySQL 任务已入队",
+			slog.String("id", task.ID),
+			slog.String("type", task.Type),
+		)
+		b.wakeUp()
+		return nil
 	}
 	if err := b.Save(task); err != nil {
 		return err
 	}
+	poolLogger().Debug("MySQL 任务已入队",
+		slog.String("id", task.ID),
+		slog.String("type", task.Type),
+	)
 	b.wakeUp()
 	return nil
 }
@@ -168,9 +205,14 @@ func (b *mysqlBackend) dequeue(ctx context.Context, timeout time.Duration) (*Tas
 	for {
 		task, err := b.claimNextTask()
 		if err != nil {
+			poolLogger().Error("MySQL 领取任务失败", slog.String("error", err.Error()))
 			return nil, err
 		}
 		if task != nil {
+			poolLogger().Debug("MySQL 任务已出队",
+				slog.String("id", task.ID),
+				slog.String("type", task.Type),
+			)
 			return task, nil
 		}
 
@@ -260,7 +302,19 @@ func (b *mysqlBackend) UpdateStatus(id string, status TaskStatus, errStr string)
 		`UPDATE taskpool_tasks SET status=?, error=?, done_at=? WHERE id=?`,
 		status, errStr, doneAt, id,
 	)
-	return err
+	if err != nil {
+		poolLogger().Error("MySQL 更新任务状态失败",
+			slog.String("id", id),
+			slog.String("status", status.String()),
+			slog.String("error", err.Error()),
+		)
+		return err
+	}
+	poolLogger().Debug("MySQL 任务状态已更新",
+		slog.String("id", id),
+		slog.String("status", status.String()),
+	)
+	return nil
 }
 
 func (b *mysqlBackend) UpdateProgress(id string, current, total int) error {
@@ -345,10 +399,17 @@ func (b *mysqlBackend) CancelBatch(batchID string) (int, error) {
 }
 
 func (b *mysqlBackend) Recover(ctx context.Context) error {
-	_, err := b.db.Exec(
+	res, err := b.db.Exec(
 		`UPDATE taskpool_tasks SET status = 0, started_at = NULL, error = '' WHERE status = 2`,
 	)
-	return err
+	if err != nil {
+		poolLogger().Error("MySQL 恢复运行中任务失败", slog.String("error", err.Error()))
+		return err
+	}
+	if n, _ := res.RowsAffected(); n > 0 {
+		poolLogger().Info("MySQL 恢复运行中任务", slog.Int64("count", n))
+	}
+	return nil
 }
 
 func (b *mysqlBackend) UpdateMetadata(id string, metadata json.RawMessage) error {

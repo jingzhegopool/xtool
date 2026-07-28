@@ -1,10 +1,11 @@
-﻿package pool
+package pool
 
 import (
 	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -71,13 +72,18 @@ func (b *sqliteBackend) Init(ctx context.Context) error {
 
 	db.Exec(`CREATE INDEX IF NOT EXISTS idx_tp_status ON taskpool_tasks(status)`)
 	db.Exec(`CREATE INDEX IF NOT EXISTS idx_tp_batch ON taskpool_tasks(batch_id)`)
+	poolLogger().Info("SQLite 后端初始化完成", slog.String("dsn", b.dsn))
 	return nil
 }
 
 func (b *sqliteBackend) Close() error {
 	if b.db != nil {
-		return b.db.Close()
+		if err := b.db.Close(); err != nil {
+			poolLogger().Error("SQLite 后端关闭失败", slog.String("error", err.Error()))
+			return err
+		}
 	}
+	poolLogger().Info("SQLite 后端已关闭")
 	return nil
 }
 
@@ -96,7 +102,19 @@ func (b *sqliteBackend) Save(task *Task) error {
 		sqltime(zeroTime(task.StartedAt)), sqltime(zeroTime(task.DoneAt)),
 		task.Error, string(task.Result), task.ProgressCurrent, task.ProgressTotal, string(task.Metadata),
 	)
-	return err
+	if err != nil {
+		poolLogger().Error("SQLite 保存任务失败",
+			slog.String("id", task.ID),
+			slog.String("type", task.Type),
+			slog.String("error", err.Error()),
+		)
+		return err
+	}
+	poolLogger().Debug("SQLite 保存任务",
+		slog.String("id", task.ID),
+		slog.String("type", task.Type),
+	)
+	return nil
 }
 
 func zeroTime(t *time.Time) time.Time {
@@ -126,6 +144,10 @@ func (b *sqliteBackend) Delete(id string) error {
 func (b *sqliteBackend) Enqueue(task *Task) error {
 	existing, err := b.Get(task.ID)
 	if err != nil && err != ErrTaskNotFound {
+		poolLogger().Error("SQLite 入队前查询失败",
+			slog.String("id", task.ID),
+			slog.String("error", err.Error()),
+		)
 		return err
 	}
 	if existing == nil {
@@ -138,9 +160,17 @@ func (b *sqliteBackend) Enqueue(task *Task) error {
 			task.Status, task.Priority, sqltime(task.ScheduledAt), task.ID,
 		)
 		if err != nil {
+			poolLogger().Error("SQLite 更新任务入队失败",
+				slog.String("id", task.ID),
+				slog.String("error", err.Error()),
+			)
 			return err
 		}
 	}
+	poolLogger().Debug("SQLite 任务已入队",
+		slog.String("id", task.ID),
+		slog.String("type", task.Type),
+	)
 	b.wakeUp()
 	return nil
 }
@@ -167,9 +197,14 @@ func (b *sqliteBackend) dequeue(ctx context.Context, timeout time.Duration) (*Ta
 	for {
 		task, err := b.claimNextTask()
 		if err != nil {
+			poolLogger().Error("SQLite 领取任务失败", slog.String("error", err.Error()))
 			return nil, err
 		}
 		if task != nil {
+			poolLogger().Debug("SQLite 任务已出队",
+				slog.String("id", task.ID),
+				slog.String("type", task.Type),
+			)
 			return task, nil
 		}
 		select {
@@ -246,7 +281,19 @@ func (b *sqliteBackend) UpdateStatus(id string, status TaskStatus, errStr string
 		`UPDATE taskpool_tasks SET status=?, error=?, done_at=? WHERE id=?`,
 		status, errStr, doneAt, id,
 	)
-	return err
+	if err != nil {
+		poolLogger().Error("SQLite 更新任务状态失败",
+			slog.String("id", id),
+			slog.String("status", status.String()),
+			slog.String("error", err.Error()),
+		)
+		return err
+	}
+	poolLogger().Debug("SQLite 任务状态已更新",
+		slog.String("id", id),
+		slog.String("status", status.String()),
+	)
+	return nil
 }
 
 func (b *sqliteBackend) UpdateProgress(id string, current, total int) error {
@@ -402,10 +449,17 @@ func (b *sqliteBackend) CancelBatch(batchID string) (int, error) {
 
 func (b *sqliteBackend) Recover(ctx context.Context) error {
 	// 将上次崩溃遗留的 StatusRunning(2) 任务重置为 StatusPending(0)
-	_, err := b.db.Exec(
+	res, err := b.db.Exec(
 		`UPDATE taskpool_tasks SET status = 0, started_at = NULL, error = '' WHERE status = 2`,
 	)
-	return err
+	if err != nil {
+		poolLogger().Error("SQLite 恢复运行中任务失败", slog.String("error", err.Error()))
+		return err
+	}
+	if n, _ := res.RowsAffected(); n > 0 {
+		poolLogger().Info("SQLite 恢复运行中任务", slog.Int64("count", n))
+	}
+	return nil
 }
 
 func (b *sqliteBackend) UpdateMetadata(id string, metadata json.RawMessage) error {

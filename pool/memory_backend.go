@@ -1,9 +1,10 @@
-﻿package pool
+package pool
 
 import (
 	"container/heap"
 	"context"
 	"encoding/json"
+	"log/slog"
 	"sync"
 	"time"
 )
@@ -44,6 +45,7 @@ func (m *memoryBackend) Close() error {
 	defer m.mu.Unlock()
 	m.closed = true
 	close(m.wait)
+	poolLogger().Debug("内存后端已关闭")
 	return nil
 }
 
@@ -54,6 +56,10 @@ func (m *memoryBackend) Save(task *Task) error {
 		task.ID = newID()
 	}
 	m.tasks[task.ID] = task
+	poolLogger().Debug("内存后端保存任务",
+		slog.String("id", task.ID),
+		slog.String("type", task.Type),
+	)
 	return nil
 }
 
@@ -80,9 +86,18 @@ func (m *memoryBackend) Enqueue(task *Task) error {
 	defer m.mu.Unlock()
 
 	if m.closed {
+		poolLogger().Warn("内存后端入队失败：队列已关闭",
+			slog.String("id", task.ID),
+			slog.String("type", task.Type),
+		)
 		return ErrQueueClosed
 	}
 	if len(m.items) >= m.cap {
+		poolLogger().Error("内存后端队列已满",
+			slog.String("id", task.ID),
+			slog.String("type", task.Type),
+			slog.Int("capacity", m.cap),
+		)
 		return ErrQueueFull
 	}
 
@@ -203,9 +218,14 @@ func (m *memoryBackend) Remove(id string) bool {
 
 	task, ok := m.tasks[id]
 	if !ok {
+		poolLogger().Debug("内存后端移除任务失败：未找到", slog.String("id", id))
 		return false
 	}
 	if task.Status != StatusPending && task.Status != StatusDelayed {
+		poolLogger().Debug("内存后端移除任务失败：状态不允许",
+			slog.String("id", id),
+			slog.String("status", task.Status.String()),
+		)
 		return false
 	}
 
@@ -341,6 +361,10 @@ func (m *memoryBackend) CancelBatch(batchID string) (int, error) {
 			cancelled++
 		}
 	}
+	poolLogger().Debug("内存后端取消批次",
+		slog.String("batch_id", batchID),
+		slog.Int("cancelled", cancelled),
+	)
 	// 清理堆
 	var remaining memHeapItems
 	for _, item := range m.items {
@@ -396,12 +420,19 @@ func (m *memoryBackend) Recover(ctx context.Context) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	// 将 running 任务重置为 pending
+	recovered := 0
 	for _, t := range m.tasks {
 		if t.Status == StatusRunning || t.Status == StatusRetrying {
 			t.Status = StatusPending
 			t.StartedAt = nil
 			t.Error = ""
+			recovered++
 		}
+	}
+	if recovered > 0 {
+		poolLogger().Info("内存后端恢复运行中任务",
+			slog.Int("count", recovered),
+		)
 	}
 	return nil
 }

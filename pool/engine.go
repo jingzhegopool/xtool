@@ -60,37 +60,72 @@ func New(cfg ...Config) (*TaskPool, error) {
 		return nil, err
 	}
 
-	if err := p.backend.Init(context.Background()); err != nil {
+	if err := p.init(); err != nil {
 		return nil, err
 	}
 
+	slog.Info("任务池已创建",
+		slog.String("backend", c.Backend),
+		slog.Int("maxWorkers", c.MaxWorkers),
+	)
+	return p, nil
+}
+
+// NewWithBackend 使用给定的 Backend 实例创建任务池，不经过配置中的 Backend 选择逻辑。
+// 适用于需要注入自定义后端的场景（如非标准数据库、已有连接、适配器等）。
+func NewWithBackend(b Backend, cfg ...Config) (*TaskPool, error) {
+	c := defaultConfig()
+	if len(cfg) > 0 {
+		c = applyConfig(c, cfg[0])
+	}
+
+	p := &TaskPool{
+		cfg:      c,
+		backend:  b,
+		handlers: make(map[string]Handler),
+		progress: make(map[string][2]int),
+	}
+
+	if err := p.init(); err != nil {
+		return nil, err
+	}
+
+	slog.Info("任务池已创建（自定义后端）",
+		slog.Int("maxWorkers", c.MaxWorkers),
+	)
+	return p, nil
+}
+
+// init 执行公共初始化逻辑。
+func (p *TaskPool) init() error {
+	if err := p.backend.Init(context.Background()); err != nil {
+		return err
+	}
+
 	// 启动时恢复：重置上次崩溃遗留的 Running 任务，保留 metadata 和进度数据
-	// Handler 可通过检查 task.ProgressCurrent 和 task.Metadata 实现断点续做
 	if err := p.backend.Recover(context.Background()); err != nil {
-		return nil, fmt.Errorf("pool: 恢复失败: %w", err)
+		return fmt.Errorf("pool: 恢复失败: %w", err)
 	}
 
 	p.ctx, p.cancel = context.WithCancel(context.Background())
 
 	// 启动工作协程
-	for i := 0; i < c.MaxWorkers; i++ {
+	for i := 0; i < p.cfg.MaxWorkers; i++ {
 		p.wg.Add(1)
 		go p.workerLoop()
 	}
 
 	// 启动批次完成检查协程
-	if c.BatchCompleteCallback {
+	if p.cfg.BatchCompleteCallback {
 		p.wg.Add(1)
 		go p.batchChecker()
 	}
 
 	p.started.Store(true)
 	poolLogger().Info("任务池已启动",
-		slog.String("backend", c.Backend),
-		slog.String("mode", c.Mode),
-		slog.Int("workers", c.MaxWorkers),
+		slog.String("workers", fmt.Sprintf("%d", p.cfg.MaxWorkers)),
 	)
-	return p, nil
+	return nil
 }
 
 // Handle 注册一个任务类型对应的处理函数。
@@ -353,7 +388,18 @@ func (p *TaskPool) executeTask(task *Task) {
 	batchCfg := p.cfg.BatchCompleteCallback
 	p.mu.Unlock()
 
+	poolLogger().Debug("开始执行任务",
+		slog.String("id", task.ID),
+		slog.String("type", task.Type),
+		slog.Int("retries", task.Retries),
+		slog.Int("max_retries", task.MaxRetries),
+	)
+
 	if !ok {
+		poolLogger().Error("未知任务类型",
+			slog.String("id", task.ID),
+			slog.String("type", task.Type),
+		)
 		p.backend.UpdateStatus(task.ID, StatusFailed, "未知的任务类型: "+task.Type)
 		p.stats.tasksFailed.Add(1)
 		if onFailedFn != nil {
@@ -377,6 +423,11 @@ func (p *TaskPool) executeTask(task *Task) {
 		defer func() {
 			if r := recover(); r != nil {
 				execErr = fmt.Errorf("pool: 处理函数发生 panic: %v", r)
+				poolLogger().Error("任务处理函数 panic",
+					slog.String("id", task.ID),
+					slog.String("type", task.Type),
+					slog.Any("panic", r),
+				)
 			}
 		}()
 		result, execErr = handler(execCtx, task)
@@ -392,12 +443,25 @@ func (p *TaskPool) executeTask(task *Task) {
 			task.Error = ""
 			task.StartedAt = nil
 
+			poolLogger().Warn("任务执行失败，准备重试",
+				slog.String("id", task.ID),
+				slog.String("type", task.Type),
+				slog.Int("retries", task.Retries),
+				slog.Int("max_retries", task.MaxRetries),
+				slog.String("error", execErr.Error()),
+			)
+
 			// 重新入队以重试
 			if err := p.backend.Enqueue(task); err != nil {
 				task.Status = StatusFailed
 				task.Error = "重试失败: " + err.Error()
 				p.backend.UpdateStatus(task.ID, StatusFailed, task.Error)
 				p.stats.tasksFailed.Add(1)
+				poolLogger().Error("任务重试入队失败",
+					slog.String("id", task.ID),
+					slog.String("type", task.Type),
+					slog.String("error", err.Error()),
+				)
 				if onFailedFn != nil {
 					onFailedFn(task, err)
 				}
@@ -409,6 +473,12 @@ func (p *TaskPool) executeTask(task *Task) {
 		task.Error = execErr.Error()
 		p.backend.UpdateStatus(task.ID, StatusFailed, task.Error)
 		p.stats.tasksFailed.Add(1)
+		poolLogger().Error("任务最终失败",
+			slog.String("id", task.ID),
+			slog.String("type", task.Type),
+			slog.Int("retries", task.Retries),
+			slog.String("error", execErr.Error()),
+		)
 		if onFailedFn != nil {
 			onFailedFn(task, execErr)
 		}
@@ -418,6 +488,10 @@ func (p *TaskPool) executeTask(task *Task) {
 		p.backend.UpdateResult(task.ID, []byte(resultBytes))
 		p.backend.UpdateStatus(task.ID, StatusCompleted, "")
 		p.stats.tasksDone.Add(1)
+		poolLogger().Info("任务执行完成",
+			slog.String("id", task.ID),
+			slog.String("type", task.Type),
+		)
 		if onCompleteFn != nil {
 			task.Result = resultBytes
 			onCompleteFn(task)
@@ -435,6 +509,10 @@ func (p *TaskPool) checkBatchCompletion(task *Task, callback func(string, []*Tas
 
 	tasks, err := p.backend.ListByBatchID(task.BatchID)
 	if err != nil {
+		poolLogger().Error("查询批次任务失败",
+			slog.String("batch_id", task.BatchID),
+			slog.String("error", err.Error()),
+		)
 		return
 	}
 
@@ -448,6 +526,10 @@ func (p *TaskPool) checkBatchCompletion(task *Task, callback func(string, []*Tas
 	}
 
 	if allDone {
+		poolLogger().Info("批次全部完成",
+			slog.String("batch_id", task.BatchID),
+			slog.Int("count", len(tasks)),
+		)
 		results := make([]*TaskResult, len(tasks))
 		for i, t := range tasks {
 			results[i] = &TaskResult{
@@ -483,6 +565,7 @@ func (p *TaskPool) batchChecker() {
 func (p *TaskPool) scanBatches() {
 	tasks, err := p.backend.ListAll(1000, 0)
 	if err != nil {
+		poolLogger().Error("扫描批次失败", slog.String("error", err.Error()))
 		return
 	}
 
@@ -511,7 +594,14 @@ func (p *TaskPool) scanBatches() {
 		}
 
 		batchTasks, err := p.backend.ListByBatchID(batchID)
-		if err != nil || len(batchTasks) == 0 {
+		if err != nil {
+			poolLogger().Error("扫描批次查询失败",
+				slog.String("batch_id", batchID),
+				slog.String("error", err.Error()),
+			)
+			continue
+		}
+		if len(batchTasks) == 0 {
 			continue
 		}
 
@@ -528,6 +618,10 @@ func (p *TaskPool) scanBatches() {
 		p.mu.Unlock()
 
 		if fn != nil {
+			poolLogger().Info("扫描发现批次完成",
+				slog.String("batch_id", batchID),
+				slog.Int("count", len(batchTasks)),
+			)
 			go fn(batchID, results)
 		}
 	}

@@ -1,4 +1,6 @@
-﻿package pool
+package pool
+
+import "log/slog"
 
 // SetProgress 更新指定任务 ID 的进度。
 // 该方法可在 Handler 中安全调用。
@@ -13,9 +15,20 @@ func (p *TaskPool) SetProgress(taskID string, current, total int) {
 
 	err := p.backend.UpdateProgress(taskID, current, total)
 	if err != nil {
+		poolLogger().Error("更新任务进度失败",
+			slog.String("id", taskID),
+			slog.Int("current", current),
+			slog.Int("total", total),
+			slog.String("error", err.Error()),
+		)
 		return
 	}
 
+	poolLogger().Debug("任务进度已更新",
+		slog.String("id", taskID),
+		slog.Int("current", current),
+		slog.Int("total", total),
+	)
 	if fn != nil {
 		fn(taskID, current, total)
 	}
