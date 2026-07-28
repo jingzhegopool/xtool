@@ -1,0 +1,20 @@
+# 二进制
+*.exe
+*.test
+*.out
+bin/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Go
+vendor/
+dist/
