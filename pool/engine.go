@@ -64,9 +64,10 @@ func New(cfg ...Config) (*TaskPool, error) {
 		return nil, err
 	}
 
-	slog.Info("任务池已创建",
+	poolLogger().Info("任务池已创建",
 		slog.String("backend", c.Backend),
-		slog.Int("maxWorkers", c.MaxWorkers),
+		slog.Int("max_workers", c.MaxWorkers),
+		slog.String("mode", c.Mode),
 	)
 	return p, nil
 }
@@ -90,8 +91,9 @@ func NewWithBackend(b Backend, cfg ...Config) (*TaskPool, error) {
 		return nil, err
 	}
 
-	slog.Info("任务池已创建（自定义后端）",
-		slog.Int("maxWorkers", c.MaxWorkers),
+	poolLogger().Info("任务池已创建（自定义后端）",
+		slog.Int("max_workers", c.MaxWorkers),
+		slog.String("mode", c.Mode),
 	)
 	return p, nil
 }
@@ -122,8 +124,8 @@ func (p *TaskPool) init() error {
 	}
 
 	p.started.Store(true)
-	poolLogger().Info("任务池已启动",
-		slog.String("workers", fmt.Sprintf("%d", p.cfg.MaxWorkers)),
+	poolLogger().Debug("任务池工作协程已启动",
+		slog.Int("workers", p.cfg.MaxWorkers),
 	)
 	return nil
 }
@@ -364,7 +366,7 @@ func (p *TaskPool) workerLoop() {
 			if err == context.Canceled || err == context.DeadlineExceeded {
 				return
 			}
-			poolLogger().Warn("出队失败", slog.String("error", err.Error()))
+			poolLogger().Debug("出队失败", slog.String("error", err.Error()))
 			continue
 		}
 

@@ -1,4 +1,4 @@
-﻿package pool
+package pool
 
 import (
 	"encoding/json"
@@ -41,28 +41,56 @@ func (s TaskStatus) String() string {
 
 // Task 表示一个工作单元。
 type Task struct {
-	ID        string          `json:"id"`
-	Type      string          `json:"type"`
-	Data      json.RawMessage `json:"data,omitempty"`
-	Status    TaskStatus      `json:"status"`
-	Priority  int             `json:"priority"`   // 优先级，数值越小优先级越高
-	BatchID   string          `json:"batch_id,omitempty"`
+	// ID 是任务的唯一标识，为空时由后端自动生成 UUID。
+	ID string `json:"id"`
 
-	Timeout    time.Duration `json:"timeout,omitempty"`
-	MaxRetries int           `json:"max_retries"`
-	Retries    int           `json:"retries"`
+	// Type 是任务类型，用于匹配对应的 Handler。
+	Type string `json:"type"`
 
-	ScheduledAt time.Time  `json:"scheduled_at,omitempty"` // 调度执行时间
-	CreatedAt   time.Time  `json:"created_at"`
-	StartedAt   *time.Time `json:"started_at,omitempty"`
-	DoneAt      *time.Time `json:"done_at,omitempty"`
+	// Data 是任务的负载数据，由用户自行定义格式。
+	Data json.RawMessage `json:"data,omitempty"`
 
-	Error  string          `json:"error,omitempty"`
+	// Status 是任务当前的生命周期状态。
+	Status TaskStatus `json:"status"`
+
+	// Priority 是任务优先级，数值越小优先级越高。
+	Priority int `json:"priority"`
+
+	// BatchID 是任务所属批次 ID，用于批次完成回调。
+	BatchID string `json:"batch_id,omitempty"`
+
+	// Timeout 是单个任务的执行超时时间，0 表示不超时。
+	Timeout time.Duration `json:"timeout,omitempty"`
+
+	// MaxRetries 是任务失败时的最大重试次数。
+	MaxRetries int `json:"max_retries"`
+
+	// Retries 是任务已经过的重试次数。
+	Retries int `json:"retries"`
+
+	// ScheduledAt 是任务的计划执行时间，零值表示立即执行。
+	ScheduledAt time.Time `json:"scheduled_at,omitempty"`
+
+	// CreatedAt 是任务的创建时间。
+	CreatedAt time.Time `json:"created_at"`
+
+	// StartedAt 是任务开始执行的时间。
+	StartedAt *time.Time `json:"started_at,omitempty"`
+
+	// DoneAt 是任务到达终态（完成/失败/取消）的时间。
+	DoneAt *time.Time `json:"done_at,omitempty"`
+
+	// Error 是任务失败时的错误信息。
+	Error string `json:"error,omitempty"`
+
+	// Result 是任务成功执行后的结果数据。
 	Result json.RawMessage `json:"result,omitempty"`
 
-	// 进度跟踪
+	// ProgressCurrent 是任务当前进度值。
 	ProgressCurrent int `json:"progress_current"`
-	ProgressTotal   int `json:"progress_total"`
+
+	// ProgressTotal 是任务总进度值，0 表示无进度概念。
+	ProgressTotal int `json:"progress_total"`
 
 	// Metadata 是用户自定义的 JSON 数据，可用于存储业务字段（如 mall_id、shop_key、
 	// 断点恢复进度等）。由用户自行管理内容，xtool/pool 仅负责持久化和读取。

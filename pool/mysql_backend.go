@@ -205,7 +205,7 @@ func (b *mysqlBackend) dequeue(ctx context.Context, timeout time.Duration) (*Tas
 	for {
 		task, err := b.claimNextTask()
 		if err != nil {
-			poolLogger().Error("MySQL 领取任务失败", slog.String("error", err.Error()))
+			poolLogger().Debug("MySQL 领取任务失败", slog.String("error", err.Error()))
 			return nil, err
 		}
 		if task != nil {

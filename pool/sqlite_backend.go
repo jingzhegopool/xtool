@@ -44,6 +44,13 @@ func (b *sqliteBackend) Init(ctx context.Context) error {
 	}
 	b.db = db
 
+	// :memory: 模式下每个连接都是独立的数据库，限制为单连接以保持表结构。
+	if b.dsn == ":memory:" {
+		db.SetMaxOpenConns(1)
+		db.SetMaxIdleConns(1)
+		db.SetConnMaxLifetime(0)
+	}
+
 	_, err = db.Exec(`
 		CREATE TABLE IF NOT EXISTS taskpool_tasks (
 			id            TEXT PRIMARY KEY,
@@ -197,7 +204,7 @@ func (b *sqliteBackend) dequeue(ctx context.Context, timeout time.Duration) (*Ta
 	for {
 		task, err := b.claimNextTask()
 		if err != nil {
-			poolLogger().Error("SQLite 领取任务失败", slog.String("error", err.Error()))
+			poolLogger().Debug("SQLite 领取任务失败", slog.String("error", err.Error()))
 			return nil, err
 		}
 		if task != nil {
