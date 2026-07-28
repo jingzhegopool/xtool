@@ -32,6 +32,7 @@ type TaskPool struct {
 	progress   map[string][2]int // taskID => [current, total]
 	progressMu sync.RWMutex
 
+	onStart         func(*Task)
 	onProgress      func(string, int, int)
 	onComplete      func(*Task)
 	onFailed        func(*Task, error)
@@ -324,6 +325,13 @@ func (p *TaskPool) SaveTaskMetadata(id string, metadata json.RawMessage) error {
 
 // ------- 回调注册 -------
 
+// OnStart 注册任务开始执行时的回调。
+func (p *TaskPool) OnStart(fn func(*Task)) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.onStart = fn
+}
+
 // OnProgress 注册任务进度更新回调。
 // 当任务当前进度/总进度变化时被调用。
 func (p *TaskPool) OnProgress(fn func(taskID string, current, total int)) {
@@ -380,6 +388,10 @@ func (p *TaskPool) executeTask(task *Task) {
 	// 在锁内获取回调引用
 	var onCompleteFn func(*Task)
 	var onFailedFn func(*Task, error)
+	var onStartFn func(*Task)
+	if p.onStart != nil {
+		onStartFn = p.onStart
+	}
 	if p.onComplete != nil {
 		onCompleteFn = p.onComplete
 	}
@@ -396,6 +408,10 @@ func (p *TaskPool) executeTask(task *Task) {
 		slog.Int("retries", task.Retries),
 		slog.Int("max_retries", task.MaxRetries),
 	)
+
+	if onStartFn != nil {
+		onStartFn(task)
+	}
 
 	if !ok {
 		poolLogger().Error("未知任务类型",
