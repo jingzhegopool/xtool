@@ -1,9 +1,10 @@
-﻿package pool
+package pool
 
 import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -14,10 +15,10 @@ type Handler func(ctx context.Context, task *Task) (any, error)
 
 // TaskPool 是面向用户的任务池，带可插拔的后端。
 type TaskPool struct {
-	cfg       Config
-	backend   Backend
-	handlers  map[string]Handler
-	mu        sync.Mutex
+	cfg      Config
+	backend  Backend
+	handlers map[string]Handler
+	mu       sync.Mutex
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -28,8 +29,8 @@ type TaskPool struct {
 		tasksFailed atomic.Int64
 	}
 
-	progress     map[string][2]int // taskID => [current, total]
-	progressMu   sync.RWMutex
+	progress   map[string][2]int // taskID => [current, total]
+	progressMu sync.RWMutex
 
 	onProgress      func(string, int, int)
 	onComplete      func(*Task)
@@ -84,6 +85,11 @@ func New(cfg ...Config) (*TaskPool, error) {
 	}
 
 	p.started.Store(true)
+	poolLogger().Info("任务池已启动",
+		slog.String("backend", c.Backend),
+		slog.String("mode", c.Mode),
+		slog.Int("workers", c.MaxWorkers),
+	)
 	return p, nil
 }
 
@@ -92,6 +98,7 @@ func (p *TaskPool) Handle(typ string, handler Handler) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.handlers[typ] = handler
+	poolLogger().Debug("注册任务处理器", slog.String("type", typ))
 }
 
 // HandleFunc 是 Handle 的便捷包装。
@@ -123,8 +130,18 @@ func (p *TaskPool) Submit(typ string, data any, opts ...SubmitOption) (string, e
 		return "", err
 	}
 	if err := p.backend.Enqueue(task); err != nil {
+		poolLogger().Error("任务入队失败",
+			slog.String("id", task.ID),
+			slog.String("type", task.Type),
+			slog.String("error", err.Error()),
+		)
 		return "", err
 	}
+	poolLogger().Info("任务已提交",
+		slog.String("id", task.ID),
+		slog.String("type", task.Type),
+		slog.String("status", task.Status.String()),
+	)
 	return task.ID, nil
 }
 
@@ -140,9 +157,27 @@ func (p *TaskPool) SubmitTask(task *Task) error {
 		task.Status = StatusDelayed
 	}
 	if err := p.backend.Save(task); err != nil {
+		poolLogger().Error("保存任务失败",
+			slog.String("id", task.ID),
+			slog.String("type", task.Type),
+			slog.String("error", err.Error()),
+		)
 		return err
 	}
-	return p.backend.Enqueue(task)
+	if err := p.backend.Enqueue(task); err != nil {
+		poolLogger().Error("任务入队失败",
+			slog.String("id", task.ID),
+			slog.String("type", task.Type),
+			slog.String("error", err.Error()),
+		)
+		return err
+	}
+	poolLogger().Info("任务已提交",
+		slog.String("id", task.ID),
+		slog.String("type", task.Type),
+		slog.String("status", task.Status.String()),
+	)
+	return nil
 }
 
 // Stop 优雅地关闭任务池：
@@ -153,19 +188,42 @@ func (p *TaskPool) Stop() {
 	if !p.started.Load() {
 		return
 	}
+	poolLogger().Info("任务池正在停止")
 	p.cancel()
 	p.wg.Wait()
-	p.backend.Close()
+	if err := p.backend.Close(); err != nil {
+		poolLogger().Error("后端关闭失败", slog.String("error", err.Error()))
+	} else {
+		poolLogger().Info("任务池已停止")
+	}
 }
 
 // Cancel 按 ID 取消一个待处理的任务。
 func (p *TaskPool) Cancel(id string) bool {
-	return p.backend.Remove(id)
+	ok := p.backend.Remove(id)
+	if ok {
+		poolLogger().Info("任务已取消", slog.String("id", id))
+	} else {
+		poolLogger().Warn("取消任务失败", slog.String("id", id))
+	}
+	return ok
 }
 
 // CancelBatch 取消指定批次中所有待处理的任务。
 func (p *TaskPool) CancelBatch(batchID string) (int, error) {
-	return p.backend.CancelBatch(batchID)
+	n, err := p.backend.CancelBatch(batchID)
+	if err != nil {
+		poolLogger().Error("取消批次失败",
+			slog.String("batch_id", batchID),
+			slog.String("error", err.Error()),
+		)
+		return n, err
+	}
+	poolLogger().Info("批次已取消",
+		slog.String("batch_id", batchID),
+		slog.Int("count", n),
+	)
+	return n, nil
 }
 
 // Stats 返回按状态分组的任务数量统计。
@@ -226,6 +284,7 @@ func (p *TaskPool) Backend() Backend {
 func (p *TaskPool) SaveTaskMetadata(id string, metadata json.RawMessage) error {
 	return p.backend.UpdateMetadata(id, metadata)
 }
+
 // ------- 回调注册 -------
 
 // OnProgress 注册任务进度更新回调。
@@ -261,6 +320,8 @@ func (p *TaskPool) OnBatchComplete(fn func(batchID string, results []*TaskResult
 
 func (p *TaskPool) workerLoop() {
 	defer p.wg.Done()
+	poolLogger().Debug("工作协程已启动")
+	defer poolLogger().Debug("工作协程已退出")
 
 	for {
 		task, err := p.backend.Dequeue(p.ctx)
@@ -268,6 +329,7 @@ func (p *TaskPool) workerLoop() {
 			if err == context.Canceled || err == context.DeadlineExceeded {
 				return
 			}
+			poolLogger().Warn("出队失败", slog.String("error", err.Error()))
 			continue
 		}
 
@@ -521,4 +583,3 @@ func marshalAny(v any) json.RawMessage {
 	}
 	return json.RawMessage(b)
 }
-
