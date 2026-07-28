@@ -1,11 +1,11 @@
-package pool
+﻿package pool
 
 import (
 	"crypto/rand"
 	"fmt"
 )
 
-// newID generates a UUID v4 using crypto/rand.
+// newID 使用 crypto/rand 生成 UUID v4。
 func newID() string {
 	var b [16]byte
 	_, _ = rand.Read(b[:])

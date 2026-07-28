@@ -1,4 +1,4 @@
-package pool
+﻿package pool
 
 import (
 	"context"
@@ -28,21 +28,21 @@ func TestMemoryBackend_SubmitAndExecute(t *testing.T) {
 		t.Fatal(err)
 	}
 	if id == "" {
-		t.Fatal("expected non-empty ID")
+		t.Fatal("期望非空的任务 ID")
 	}
 
 	time.Sleep(100 * time.Millisecond)
 	if !executed.Load() {
-		t.Fatal("handler was not executed")
+		t.Fatal("处理函数未被执行")
 	}
 }
 
 func TestMemoryBackend_Priority(t *testing.T) {
-	// Test priority ordering directly via the backend queue
+	// 通过后端队列直接测试优先级排序
 	q, _ := newMemoryBackend(Config{MaxQueueSize: 100})
 	ctx := context.Background()
 
-	// Submit tasks in reverse priority order (worst first)
+	// 按逆优先级顺序提交（最差的排最前）
 	tasks := []*Task{
 		{ID: newID(), Type: "test", Data: marshalAny("low"), Priority: 10, Status: StatusPending, CreatedAt: time.Now()},
 		{ID: newID(), Type: "test", Data: marshalAny("medium"), Priority: 5, Status: StatusPending, CreatedAt: time.Now().Add(1 * time.Millisecond)},
@@ -53,7 +53,7 @@ func TestMemoryBackend_Priority(t *testing.T) {
 		q.(*memoryBackend).Enqueue(t)
 	}
 
-	// Should dequeue in priority order: high → medium → low
+	// 出队顺序应为：high -> medium -> low
 	for _, expected := range []string{"high", "medium", "low"} {
 		got, err := q.Dequeue(ctx)
 		if err != nil {
@@ -62,7 +62,7 @@ func TestMemoryBackend_Priority(t *testing.T) {
 		var val string
 		got.Decode(&val)
 		if val != expected {
-			t.Errorf("expected %s, got %s", expected, val)
+			t.Errorf("期望 %s，实际得到 %s", expected, val)
 		}
 	}
 }
@@ -89,10 +89,10 @@ func TestMemoryBackend_Delay(t *testing.T) {
 	time.Sleep(500 * time.Millisecond)
 
 	if !executed.Load() {
-		t.Fatal("delayed task was not executed")
+		t.Fatal("延迟任务未被执行")
 	}
 	if executedAt.Sub(start) < 200*time.Millisecond {
-		t.Fatal("task executed too early")
+		t.Fatal("任务执行过早")
 	}
 }
 
@@ -124,10 +124,10 @@ func TestMemoryBackend_BatchComplete(t *testing.T) {
 	select {
 	case bid := <-done:
 		if bid != "batch_a" {
-			t.Fatalf("expected batch_a, got %s", bid)
+			t.Fatalf("期望 batch_a，实际得到 %s", bid)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("timeout waiting for batch completion")
+		t.Fatal("等待批次完成超时")
 	}
 }
 
@@ -153,11 +153,11 @@ func TestMemoryBackend_Stats(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	t.Logf("Stats: completed=%d failed=%d pending=%d",
+	t.Logf("统计：完成=%d 失败=%d 待处理=%d",
 		stats[StatusCompleted], stats[StatusFailed], stats[StatusPending])
 
 	if stats[StatusCompleted] == 0 {
-		t.Fatal("expected at least 1 completed task")
+		t.Fatal("期望至少 1 个已完成任务")
 	}
 }
 
@@ -182,7 +182,7 @@ func TestMemoryBackend_OnFailed(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 
 	if !failed.Load() {
-		t.Fatal("OnFailed callback not triggered")
+		t.Fatal("OnFailed 回调未被触发")
 	}
 }
 
@@ -194,7 +194,7 @@ func TestMemoryBackend_PanicRecovery(t *testing.T) {
 	defer p.Stop()
 
 	p.Handle("panic", func(ctx context.Context, task *Task) (any, error) {
-		panic("test panic")
+		panic("测试 panic")
 	})
 
 	var failed atomic.Bool
@@ -207,10 +207,10 @@ func TestMemoryBackend_PanicRecovery(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 
 	if !failed.Load() {
-		t.Fatal("panic should trigger OnFailed")
+		t.Fatal("panic 应触发 OnFailed 回调")
 	}
 
-	// Pool should still work
+	// 任务池应仍然正常工作
 	var worked atomic.Bool
 	p.Handle("ok", func(ctx context.Context, task *Task) (any, error) {
 		worked.Store(true)
@@ -220,7 +220,7 @@ func TestMemoryBackend_PanicRecovery(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	if !worked.Load() {
-		t.Fatal("pool should still work after panic")
+		t.Fatal("panic 后任务池应仍能正常工作")
 	}
 }
 
@@ -242,14 +242,14 @@ func TestMemoryBackend_Cancel(t *testing.T) {
 	id2, _ := p.Submit("slow", "second")
 
 	if !p.Cancel(id2) {
-		t.Fatal("Cancel returned false")
+		t.Fatal("Cancel 返回 false")
 	}
 
 	time.Sleep(600 * time.Millisecond)
 
 	stats, _ := p.Stats()
 	if stats[StatusPending] > 0 {
-		t.Error("expected no pending tasks after cancel")
+		t.Error("取消后应无待处理任务")
 	}
 }
 
@@ -274,7 +274,7 @@ func TestMemoryBackend_Progress(t *testing.T) {
 
 	prog := p.Progress()
 	if v, ok := prog[id]; ok {
-		t.Logf("Progress for %s: %d/%d", id, v[0], v[1])
+		t.Logf("任务 %s 的进度：%d/%d", id, v[0], v[1])
 	}
 }
 
@@ -299,7 +299,7 @@ func TestSQLiteBackend(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	if !executed.Load() {
-		t.Fatal("SQLite: handler was not executed")
+		t.Fatal("SQLite：处理函数未被执行")
 	}
 }
 
@@ -320,7 +320,7 @@ func TestSQLiteBackend_Persistence(t *testing.T) {
 	id, _ := p.Submit("store", "data")
 	p.Stop()
 
-	// Reopen same DB
+	// 重新打开同一个数据库
 	p2, err := New(Config{
 		Backend:    "sqlite",
 		DSN:        ":memory:",
@@ -334,12 +334,12 @@ func TestSQLiteBackend_Persistence(t *testing.T) {
 	task, err := p2.GetTask(id)
 	if err != nil {
 		if err == ErrTaskNotFound {
-			t.Log("Expected: in-memory SQLite is per-connection, task not found in new session")
+			t.Log("预期行为：内存 SQLite 是每个连接独立的，新会话中找不到任务")
 		} else {
 			t.Fatal(err)
 		}
 	} else {
-		t.Logf("Found task: %s status=%s", task.ID, task.Status)
+		t.Logf("找到任务：%s 状态=%s", task.ID, task.Status)
 	}
 }
 
@@ -374,8 +374,8 @@ func TestParallelMode(t *testing.T) {
 	time.Sleep(500 * time.Millisecond)
 
 	n := maxSeen.Load()
-	t.Logf("Max concurrent: %d", n)
+	t.Logf("最大并发数：%d", n)
 	if n < 2 {
-		t.Fatal("expected at least 2 concurrent executions in parallel mode")
+		t.Fatal("并行模式下期望至少 2 个并发执行")
 	}
 }

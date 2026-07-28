@@ -1,8 +1,8 @@
-package pool
+﻿package pool
 
-// SetProgress updates the progress for a task with the given ID.
-// This method is safe to call from within a Handler.
-// The progress callback (OnProgress) is fired after updating.
+// SetProgress 更新指定任务 ID 的进度。
+// 该方法可在 Handler 中安全调用。
+// 更新后会自动触发进度回调（OnProgress）。
 func (p *TaskPool) SetProgress(taskID string, current, total int) {
 	p.progressMu.Lock()
 	p.progress[taskID] = [2]int{current, total}
@@ -11,7 +11,10 @@ func (p *TaskPool) SetProgress(taskID string, current, total int) {
 	p.mu.Unlock()
 	p.progressMu.Unlock()
 
-	p.backend.UpdateProgress(taskID, current, total)
+	err := p.backend.UpdateProgress(taskID, current, total)
+	if err != nil {
+		return
+	}
 
 	if fn != nil {
 		fn(taskID, current, total)

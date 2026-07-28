@@ -1,4 +1,4 @@
-package pool
+﻿package pool
 
 import (
 	"container/heap"
@@ -7,15 +7,15 @@ import (
 	"time"
 )
 
-// memoryBackend stores tasks in an in-memory map + priority queue.
+// memoryBackend 将任务存储在内存中的 map + 优先级队列中。
 type memoryBackend struct {
 	mu       sync.Mutex
 	tasks    map[string]*Task
 	items    memHeapItems
 	cap      int
 	closed   bool
-	wait     chan struct{} // enqueue signal for blocking Dequeue
-	progress map[string][2]int // id → [current, total]
+	wait     chan struct{} // 入队信号，用于阻塞 Dequeue
+	progress map[string][2]int // id => [current, total]
 }
 
 func newMemoryBackend(cfg Config) (Backend, error) {
@@ -87,7 +87,7 @@ func (m *memoryBackend) Enqueue(task *Task) error {
 
 	m.tasks[task.ID] = task
 
-	// Always push to heap; dequeue checks ScheduledAt and status
+	// 始终推入堆；Dequeue 会检查 ScheduledAt 和状态
 	heap.Push(&m.items, &memItem{
 		id:       task.ID,
 		priority: task.Priority,
@@ -98,7 +98,7 @@ func (m *memoryBackend) Enqueue(task *Task) error {
 	return nil
 }
 
-// Dequeue blocks until a pending task is available.
+// Dequeue 阻塞等待直到有可用的待处理任务。
 func (m *memoryBackend) Dequeue(ctx context.Context) (*Task, error) {
 	return m.dequeue(ctx, 0)
 }
@@ -111,7 +111,7 @@ func (m *memoryBackend) dequeue(ctx context.Context, timeout time.Duration) (*Ta
 	m.mu.Lock()
 
 	for {
-		// Find the first pending task that is ready (ScheduledAt <= now)
+		// 找到第一个准备就绪的待处理任务（ScheduledAt <= 当前时间）
 		now := time.Now()
 		idx := -1
 		var earliestDelay time.Time
@@ -120,13 +120,13 @@ func (m *memoryBackend) dequeue(ctx context.Context, timeout time.Duration) (*Ta
 			if task == nil {
 				continue
 			}
-			// Consider both pending and delayed tasks (delayed becomes pending when ScheduledAt passes)
+			// 同时检查 pending 和 delayed 状态（延迟任务在 ScheduledAt 到达后变为 pending）
 			if task.Status == StatusPending || task.Status == StatusDelayed {
 				if task.ScheduledAt.IsZero() || task.ScheduledAt.Before(now) {
 					idx = i
 					break
 				}
-				// Track earliest delayed task for sleeping
+				// 记录最早的延迟任务，用于休眠等待
 				if earliestDelay.IsZero() || task.ScheduledAt.Before(earliestDelay) {
 					earliestDelay = task.ScheduledAt
 				}
@@ -148,7 +148,7 @@ func (m *memoryBackend) dequeue(ctx context.Context, timeout time.Duration) (*Ta
 			return nil, ErrQueueClosed
 		}
 
-		// Calculate sleep duration until earliest delayed task or use default
+		// 计算需要休眠到最早延迟任务的时间
 		var sleepDuration time.Duration
 		if !earliestDelay.IsZero() {
 			sleepDuration = time.Until(earliestDelay)
@@ -167,16 +167,15 @@ func (m *memoryBackend) dequeue(ctx context.Context, timeout time.Duration) (*Ta
 			timeoutCh = timer.C
 		}
 
-		// Build the select with proper timeout handling
 		select {
 		case <-wait:
-			// New task enqueued, re-check
+			// 有新任务入队，重新检查
 		case <-timeoutCh:
 			return nil, context.DeadlineExceeded
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		case <-time.After(sleepDuration):
-			// Woke up because a delayed task should be ready
+			// 因延迟任务应已就绪而唤醒
 		}
 
 		m.mu.Lock()
@@ -189,7 +188,6 @@ func (m *memoryBackend) Pending() int {
 	count := 0
 	for _, task := range m.tasks {
 		if task.Status == StatusPending {
-			// Check if ready
 			if task.ScheduledAt.IsZero() || task.ScheduledAt.Before(time.Now()) {
 				count++
 			}
@@ -210,7 +208,7 @@ func (m *memoryBackend) Remove(id string) bool {
 		return false
 	}
 
-	// Remove from heap
+	// 从堆中移除
 	for i, item := range m.items {
 		if item.id == id {
 			heap.Remove(&m.items, i)
@@ -280,7 +278,7 @@ func (m *memoryBackend) ListByStatus(status TaskStatus, limit, offset int) ([]*T
 			result = append(result, t)
 		}
 	}
-	// Simple pagination (no sorting guarantee)
+	// 简单分页（不保证排序）
 	if offset >= len(result) {
 		return nil, nil
 	}
@@ -318,13 +316,13 @@ func (m *memoryBackend) CountByStatus() (map[TaskStatus]int, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	counts := map[TaskStatus]int{
-		StatusPending:  0,
-		StatusDelayed:  0,
-		StatusRunning:  0,
+		StatusPending:   0,
+		StatusDelayed:   0,
+		StatusRunning:   0,
 		StatusCompleted: 0,
-		StatusFailed:   0,
+		StatusFailed:    0,
 		StatusCancelled: 0,
-		StatusRetrying: 0,
+		StatusRetrying:  0,
 	}
 	for _, t := range m.tasks {
 		counts[t.Status]++
@@ -342,7 +340,7 @@ func (m *memoryBackend) CancelBatch(batchID string) (int, error) {
 			cancelled++
 		}
 	}
-	// Clean up heap
+	// 清理堆
 	var remaining memHeapItems
 	for _, item := range m.items {
 		t := m.tasks[item.id]
@@ -356,16 +354,16 @@ func (m *memoryBackend) CancelBatch(batchID string) (int, error) {
 	return cancelled, nil
 }
 
-// --- heap item ---
+// ------- 堆元素 -------
 
-// memItem is an item in the memory priority heap.
+// memItem 是内存优先队列堆中的元素。
 type memItem struct {
 	id       string
 	priority int
 	created  time.Time
 }
 
-// memHeapItems implements heap.Interface.
+// memHeapItems 实现 heap.Interface 接口。
 type memHeapItems []*memItem
 
 func (h memHeapItems) Len() int { return len(h) }

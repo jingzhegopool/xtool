@@ -1,14 +1,14 @@
-package pool
+﻿package pool
 
 import "errors"
 
 var (
-	ErrQueueFull     = errors.New("pool: queue is full")
-	ErrQueueClosed   = errors.New("pool: queue is closed")
-	ErrUnknownType   = errors.New("pool: unknown task type")
-	ErrPoolStopped   = errors.New("pool: pool is stopped")
-	ErrTaskNotFound  = errors.New("pool: task not found")
-	ErrUnsupported   = errors.New("pool: unsupported backend")
-	ErrInvalidConfig = errors.New("pool: invalid config")
-	ErrModeConflict  = errors.New("pool: stop_on_error requires sequential mode")
+	ErrQueueFull     = errors.New("pool: 队列已满")
+	ErrQueueClosed   = errors.New("pool: 队列已关闭")
+	ErrUnknownType   = errors.New("pool: 未知的任务类型")
+	ErrPoolStopped   = errors.New("pool: 任务池已停止")
+	ErrTaskNotFound  = errors.New("pool: 任务未找到")
+	ErrUnsupported   = errors.New("pool: 不支持的存储后端")
+	ErrInvalidConfig = errors.New("pool: 无效的配置")
+	ErrModeConflict  = errors.New("pool: stop_on_error 错误策略需要 sequential 串行模式")
 )

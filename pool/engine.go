@@ -1,4 +1,4 @@
-package pool
+﻿package pool
 
 import (
 	"context"
@@ -9,10 +9,10 @@ import (
 	"time"
 )
 
-// Handler is a user-registered function that processes a task.
+// Handler 是用户注册的处理任务的函数类型。
 type Handler func(ctx context.Context, task *Task) (any, error)
 
-// TaskPool is the user-facing task pool with pluggable backends.
+// TaskPool 是面向用户的任务池，带可插拔的后端。
 type TaskPool struct {
 	cfg       Config
 	backend   Backend
@@ -28,7 +28,7 @@ type TaskPool struct {
 		tasksFailed atomic.Int64
 	}
 
-	progress     map[string][2]int // taskID → [current, total]
+	progress     map[string][2]int // taskID => [current, total]
 	progressMu   sync.RWMutex
 
 	onProgress      func(string, int, int)
@@ -39,8 +39,8 @@ type TaskPool struct {
 	started atomic.Bool
 }
 
-// New creates a new task pool with the given configuration.
-// Backend tables (SQLite/MySQL) are auto-initialized on creation.
+// New 创建一个任务池，使用给定的配置。
+// SQLite/MySQL 后端的数据库表在创建时自动初始化。
 func New(cfg ...Config) (*TaskPool, error) {
 	c := defaultConfig()
 	if len(cfg) > 0 {
@@ -65,13 +65,13 @@ func New(cfg ...Config) (*TaskPool, error) {
 
 	p.ctx, p.cancel = context.WithCancel(context.Background())
 
-	// Start workers
+	// 启动工作协程
 	for i := 0; i < c.MaxWorkers; i++ {
 		p.wg.Add(1)
 		go p.workerLoop()
 	}
 
-	// Start batch checker
+	// 启动批次完成检查协程
 	if c.BatchCompleteCallback {
 		p.wg.Add(1)
 		go p.batchChecker()
@@ -81,19 +81,19 @@ func New(cfg ...Config) (*TaskPool, error) {
 	return p, nil
 }
 
-// Handle registers a handler for a task type.
+// Handle 注册一个任务类型对应的处理函数。
 func (p *TaskPool) Handle(typ string, handler Handler) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.handlers[typ] = handler
 }
 
-// HandleFunc is a convenience wrapper for Handle.
+// HandleFunc 是 Handle 的便捷包装。
 func (p *TaskPool) HandleFunc(typ string, fn func(ctx context.Context, task *Task) (any, error)) {
 	p.Handle(typ, fn)
 }
 
-// Submit enqueues a new task and returns its ID.
+// Submit 提交一个新任务到队列，并返回其 ID。
 func (p *TaskPool) Submit(typ string, data any, opts ...SubmitOption) (string, error) {
 	task := &Task{
 		Type:       typ,
@@ -108,7 +108,7 @@ func (p *TaskPool) Submit(typ string, data any, opts ...SubmitOption) (string, e
 		opt(task)
 	}
 
-	// Handle delayed tasks
+	// 处理延迟任务
 	if !task.ScheduledAt.IsZero() {
 		task.Status = StatusDelayed
 	}
@@ -122,7 +122,7 @@ func (p *TaskPool) Submit(typ string, data any, opts ...SubmitOption) (string, e
 	return task.ID, nil
 }
 
-// SubmitTask directly submits a pre-constructed Task.
+// SubmitTask 直接提交一个预先构造好的 Task。
 func (p *TaskPool) SubmitTask(task *Task) error {
 	if task.ID == "" {
 		task.ID = newID()
@@ -139,10 +139,10 @@ func (p *TaskPool) SubmitTask(task *Task) error {
 	return p.backend.Enqueue(task)
 }
 
-// Stop gracefully shuts down the pool:
-// - stops consuming new tasks
-// - waits for running tasks to complete
-// - closes the backend
+// Stop 优雅地关闭任务池：
+// - 停止消费新任务
+// - 等待正在运行的任务完成
+// - 关闭后端存储
 func (p *TaskPool) Stop() {
 	if !p.started.Load() {
 		return
@@ -152,23 +152,23 @@ func (p *TaskPool) Stop() {
 	p.backend.Close()
 }
 
-// Cancel removes a pending task by ID.
+// Cancel 按 ID 取消一个待处理的任务。
 func (p *TaskPool) Cancel(id string) bool {
 	return p.backend.Remove(id)
 }
 
-// CancelBatch cancels all pending tasks in a batch.
+// CancelBatch 取消指定批次中所有待处理的任务。
 func (p *TaskPool) CancelBatch(batchID string) (int, error) {
 	return p.backend.CancelBatch(batchID)
 }
 
-// Stats returns task count statistics by status.
+// Stats 返回按状态分组的任务数量统计。
 func (p *TaskPool) Stats() (map[TaskStatus]int, error) {
 	return p.backend.CountByStatus()
 }
 
-// Progress returns progress snapshots for all tasks.
-// Key is task ID, value is [current, total].
+// Progress 返回所有任务的进度快照。
+// Key 为任务 ID，value 为 [当前进度, 总进度]。
 func (p *TaskPool) Progress() map[string][2]int {
 	p.progressMu.RLock()
 	defer p.progressMu.RUnlock()
@@ -179,73 +179,73 @@ func (p *TaskPool) Progress() map[string][2]int {
 	return result
 }
 
-// Tasks returns a paginated list of all tasks.
+// Tasks 返回分页的任务列表。
 func (p *TaskPool) Tasks(limit, offset int) ([]*Task, error) {
 	return p.backend.ListAll(limit, offset)
 }
 
-// TasksByStatus returns tasks filtered by status.
+// TasksByStatus 返回按状态筛选的任务列表。
 func (p *TaskPool) TasksByStatus(status TaskStatus, limit, offset int) ([]*Task, error) {
 	return p.backend.ListByStatus(status, limit, offset)
 }
 
-// GetTask returns a single task by ID.
+// GetTask 根据 ID 获取单个任务。
 func (p *TaskPool) GetTask(id string) (*Task, error) {
 	return p.backend.Get(id)
 }
 
-// DeleteTask removes a task by ID from storage.
+// DeleteTask 从存储中删除指定 ID 的任务。
 func (p *TaskPool) DeleteTask(id string) error {
 	return p.backend.Delete(id)
 }
 
-// Pause is not supported in v0.2.0. Reserved for future use.
+// Pause 在 v0.2.0 中不支持。保留以供后续版本使用。
 func (p *TaskPool) Pause() {
-	// no-op
+	// 空操作
 }
 
-// Resume is not supported in v0.2.0. Reserved for future use.
+// Resume 在 v0.2.0 中不支持。保留以供后续版本使用。
 func (p *TaskPool) Resume() {
-	// no-op
+	// 空操作
 }
 
-// Backend returns the underlying backend for direct access.
+// Backend 返回底层的后端实例，供直接访问。
 func (p *TaskPool) Backend() Backend {
 	return p.backend
 }
 
-// --- Callbacks ---
+// ------- 回调注册 -------
 
-// OnProgress registers a callback for task progress updates.
-// Called when a task's current/total progress changes.
+// OnProgress 注册任务进度更新回调。
+// 当任务当前进度/总进度变化时被调用。
 func (p *TaskPool) OnProgress(fn func(taskID string, current, total int)) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.onProgress = fn
 }
 
-// OnComplete registers a callback for successful task completion.
+// OnComplete 注册任务成功完成的回调。
 func (p *TaskPool) OnComplete(fn func(*Task)) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.onComplete = fn
 }
 
-// OnFailed registers a callback for task failure (final, no more retries).
+// OnFailed 注册任务失败（最终失败，不再重试）的回调。
 func (p *TaskPool) OnFailed(fn func(*Task, error)) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.onFailed = fn
 }
 
-// OnBatchComplete registers a callback when all tasks in a batch finish.
+// OnBatchComplete 注册一个批次所有任务完成时的回调。
 func (p *TaskPool) OnBatchComplete(fn func(batchID string, results []*TaskResult)) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.onBatchComplete = fn
 }
 
-// --- Worker Loop ---
+// ------- 工作协程 -------
 
 func (p *TaskPool) workerLoop() {
 	defer p.wg.Done()
@@ -266,7 +266,7 @@ func (p *TaskPool) workerLoop() {
 func (p *TaskPool) executeTask(task *Task) {
 	p.mu.Lock()
 	handler, ok := p.handlers[task.Type]
-	// Grab callbacks under lock
+	// 在锁内获取回调引用
 	var onCompleteFn func(*Task)
 	var onFailedFn func(*Task, error)
 	if p.onComplete != nil {
@@ -280,7 +280,7 @@ func (p *TaskPool) executeTask(task *Task) {
 	p.mu.Unlock()
 
 	if !ok {
-		p.backend.UpdateStatus(task.ID, StatusFailed, "unknown task type: "+task.Type)
+		p.backend.UpdateStatus(task.ID, StatusFailed, "未知的任务类型: "+task.Type)
 		p.stats.tasksFailed.Add(1)
 		if onFailedFn != nil {
 			onFailedFn(task, ErrUnknownType)
@@ -302,7 +302,7 @@ func (p *TaskPool) executeTask(task *Task) {
 	func() {
 		defer func() {
 			if r := recover(); r != nil {
-				execErr = fmt.Errorf("pool: panic in handler: %v", r)
+				execErr = fmt.Errorf("pool: 处理函数发生 panic: %v", r)
 			}
 		}()
 		result, execErr = handler(execCtx, task)
@@ -318,10 +318,10 @@ func (p *TaskPool) executeTask(task *Task) {
 			task.Error = ""
 			task.StartedAt = nil
 
-			// Re-enqueue for retry
+			// 重新入队以重试
 			if err := p.backend.Enqueue(task); err != nil {
 				task.Status = StatusFailed
-				task.Error = "retry: " + err.Error()
+				task.Error = "重试失败: " + err.Error()
 				p.backend.UpdateStatus(task.ID, StatusFailed, task.Error)
 				p.stats.tasksFailed.Add(1)
 				if onFailedFn != nil {
@@ -353,7 +353,7 @@ func (p *TaskPool) executeTask(task *Task) {
 	p.checkBatchCompletion(task, onBatch, batchCfg)
 }
 
-// checkBatchCompletion checks if all tasks in the batch are done.
+// checkBatchCompletion 检查批次中的所有任务是否都已完成。
 func (p *TaskPool) checkBatchCompletion(task *Task, callback func(string, []*TaskResult), enabled bool) {
 	if !enabled || task.BatchID == "" || callback == nil {
 		return
@@ -364,7 +364,7 @@ func (p *TaskPool) checkBatchCompletion(task *Task, callback func(string, []*Tas
 		return
 	}
 
-	// Check if all tasks are in a terminal state
+	// 检查所有任务是否都处于终态
 	allDone := len(tasks) > 0
 	for _, t := range tasks {
 		if t.Status != StatusCompleted && t.Status != StatusFailed && t.Status != StatusCancelled {
@@ -388,9 +388,9 @@ func (p *TaskPool) checkBatchCompletion(task *Task, callback func(string, []*Tas
 	}
 }
 
-// batchChecker periodically checks batch completion for memory backend
-// (which doesn't have database-level triggers). Redundant but harmless
-// for SQLite/MySQL.
+// batchChecker 定期扫描批次完成状态。
+// 对内存后端是必需的（没有数据库级触发器）。
+// 对 SQLite/MySQL 是冗余但无害的。
 func (p *TaskPool) batchChecker() {
 	defer p.wg.Done()
 	ticker := time.NewTicker(5 * time.Second)
@@ -412,8 +412,6 @@ func (p *TaskPool) scanBatches() {
 		return
 	}
 
-	// Collect unique batch IDs that have at least one completed task
-	// and no running tasks
 	type batchState struct {
 		allDone bool
 		results []*TaskResult
@@ -461,7 +459,7 @@ func (p *TaskPool) scanBatches() {
 	}
 }
 
-// --- Submit options ---
+// ------- 提交选项 -------
 
 type SubmitOption func(*Task)
 
@@ -499,7 +497,7 @@ func WithScheduleAt(tm time.Time) SubmitOption {
 	}
 }
 
-// --- helpers ---
+// ------- 辅助函数 -------
 
 func marshalAny(v any) json.RawMessage {
 	if v == nil {

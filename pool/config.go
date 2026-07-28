@@ -1,50 +1,50 @@
-package pool
+﻿package pool
 
 import "time"
 
-// Config controls the task pool behavior.
+// Config 控制任务池的行为配置。
 type Config struct {
-	// Backend specifies the storage backend: "memory", "sqlite", or "mysql".
-	// Default: "memory".
+	// Backend 指定存储后端类型："memory"、"sqlite" 或 "mysql"。
+	// 默认值："memory"。
 	Backend string `json:"backend"`
 
-	// DSN is the data source name for database backends.
-	// SQLite: "./tasks.db"
-	// MySQL:  "user:pass@tcp(127.0.0.1:3306)/dbname"
+	// DSN 是数据库后端的数据源名称。
+	// SQLite："./tasks.db"
+	// MySQL：  "user:pass@tcp(127.0.0.1:3306)/dbname"
 	DSN string `json:"dsn"`
 
-	// Mode controls execution: "parallel" or "sequential".
-	// Default: "parallel".
+	// Mode 控制执行模式："parallel"（并发）或 "sequential"（串行）。
+	// 默认值："parallel"。
 	Mode string `json:"mode"`
 
-	// MaxWorkers is the maximum number of concurrent workers.
-	// In sequential mode this is always 1.
-	// Default: 5.
+	// MaxWorkers 是最大并发工作协程数。
+	// 串行模式下固定为 1。
+	// 默认值：5。
 	MaxWorkers int `json:"max_workers"`
 
-	// OnError controls behavior on task failure:
-	//   "continue" - log error and continue to next task
-	//   "stop"     - stop processing and cancel remaining pending tasks in current batch
-	// Default: "continue".
+	// OnError 控制任务失败时的行为：
+	//   "continue" - 记录错误并继续执行下一个任务
+	//   "stop"     - 停止处理并取消当前批次中剩余的待执行任务
+	// 默认值："continue"。
 	OnError string `json:"on_error"`
 
-	// MaxRetries is the default retry count for tasks.
-	// Default: 0 (no retry).
+	// MaxRetries 是任务的默认重试次数。
+	// 默认值：0（不重试）。
 	MaxRetries int `json:"max_retries"`
 
-	// DefaultTimeout is the default execution timeout per task.
-	// Default: 0 (no timeout).
+	// DefaultTimeout 是每个任务的默认执行超时时间。
+	// 默认值：0（无超时）。
 	DefaultTimeout time.Duration `json:"default_timeout"`
 
-	// PollInterval is how often database backends poll for new tasks.
-	// Only used for SQLite/MySQL backends (memory uses channel-based blocking).
-	// Default: 200ms.
+	// PollInterval 是数据库后端轮询新任务的间隔时间。
+	// 仅用于 SQLite/MySQL 后端（内存后端使用基于通道的阻塞机制）。
+	// 默认值：200ms。
 	PollInterval time.Duration `json:"poll_interval"`
 
-	// MaxQueueSize for memory backend. Default: 100000.
+	// MaxQueueSize 是内存后端的最大队列大小。默认值：100000。
 	MaxQueueSize int `json:"max_queue_size"`
 
-	// BatchCompleteCallback if true, fires OnBatchComplete when all tasks in a batch are done.
+	// BatchCompleteCallback 若为 true，则当批次内所有任务完成时触发 OnBatchComplete 回调。
 	BatchCompleteCallback bool `json:"batch_complete_callback"`
 }
 
@@ -89,7 +89,7 @@ func applyConfig(def Config, user Config) Config {
 	if user.MaxQueueSize > 0 {
 		def.MaxQueueSize = user.MaxQueueSize
 	}
-	// Sequential mode forces MaxWorkers = 1
+	// 串行模式强制 MaxWorkers = 1
 	if def.Mode == "sequential" {
 		def.MaxWorkers = 1
 	}

@@ -1,4 +1,4 @@
-package pool
+﻿package pool
 
 import (
 	"context"
@@ -10,16 +10,16 @@ import (
 	_ "github.com/go-sql-driver/mysql"
 )
 
-// mysqlBackend stores tasks in a MySQL database.
+// mysqlBackend 将任务存储在 MySQL 数据库中。
 type mysqlBackend struct {
 	db     *sql.DB
 	cfg    Config
-	notify chan struct{}
+	notify chan struct{} // 唤醒阻塞的 Dequeue
 }
 
 func newMySQLBackend(cfg Config) (Backend, error) {
 	if cfg.DSN == "" {
-		return nil, fmt.Errorf("%w: mysql DSN is required", ErrInvalidConfig)
+		return nil, fmt.Errorf("%w: MySQL DSN 是必需的", ErrInvalidConfig)
 	}
 	return &mysqlBackend{
 		cfg:    cfg,
@@ -34,7 +34,7 @@ func init() {
 func (b *mysqlBackend) Init(ctx context.Context) error {
 	db, err := sql.Open("mysql", b.cfg.DSN)
 	if err != nil {
-		return fmt.Errorf("pool/mysql: open: %w", err)
+		return fmt.Errorf("pool/mysql: 打开数据库失败: %w", err)
 	}
 	b.db = db
 
@@ -43,7 +43,7 @@ func (b *mysqlBackend) Init(ctx context.Context) error {
 	db.SetConnMaxLifetime(5 * time.Minute)
 
 	if err := db.PingContext(ctx); err != nil {
-		return fmt.Errorf("pool/mysql: ping: %w", err)
+		return fmt.Errorf("pool/mysql: 连接测试失败: %w", err)
 	}
 
 	_, err = db.Exec(`
@@ -71,7 +71,7 @@ func (b *mysqlBackend) Init(ctx context.Context) error {
 		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
 	`)
 	if err != nil {
-		return fmt.Errorf("pool/mysql: create table: %w", err)
+		return fmt.Errorf("pool/mysql: 创建表失败: %w", err)
 	}
 	return nil
 }
@@ -108,8 +108,6 @@ func nullTime(t time.Time) *time.Time {
 	}
 	return &t
 }
-
-// --- Query helpers ---
 
 const mysqlSelectCols = `id, type, COALESCE(data,''), status, priority, COALESCE(batch_id,''), timeout_ms, max_retries, retries, scheduled_at, created_at, started_at, done_at, COALESCE(error,''), COALESCE(result,''), progress_current, progress_total`
 
@@ -188,6 +186,8 @@ func (b *mysqlBackend) dequeue(ctx context.Context, timeout time.Duration) (*Tas
 	}
 }
 
+// claimNextTask 在事务中选取并锁定下一个可执行任务。
+// 使用 SELECT ... FOR UPDATE SKIP LOCKED 避免竞争（需要 MySQL 8.0+）。
 func (b *mysqlBackend) claimNextTask() (*Task, error) {
 	now := time.Now()
 
@@ -197,7 +197,7 @@ func (b *mysqlBackend) claimNextTask() (*Task, error) {
 	}
 	defer tx.Rollback()
 
-	// SELECT ... FOR UPDATE SKIP LOCKED (MySQL 8.0+)
+	// SELECT ... FOR UPDATE SKIP LOCKED（MySQL 8.0+）
 	row := tx.QueryRow(`
 		SELECT `+mysqlSelectCols+` FROM taskpool_tasks
 		WHERE status = 0 AND (scheduled_at IS NULL OR scheduled_at <= ?)
@@ -350,7 +350,11 @@ func (b *mysqlBackend) wakeUp() {
 	}
 }
 
-// --- Scan helpers ---
+// ------- 扫描辅助函数 -------
+
+type mysqlScanner interface {
+	Scan(dest ...interface{}) error
+}
 
 func (b *mysqlBackend) scanTask(s mysqlScanner) (*Task, error) {
 	t := &Task{}
@@ -410,9 +414,4 @@ func (b *mysqlBackend) scanTasks(rows *sql.Rows) ([]*Task, error) {
 		tasks = append(tasks, t)
 	}
 	return tasks, rows.Err()
-}
-
-// mysqlScanner is satisfied by both *sql.Row and *sql.Rows.
-type mysqlScanner interface {
-	Scan(dest ...interface{}) error
 }

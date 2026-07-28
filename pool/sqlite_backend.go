@@ -1,4 +1,4 @@
-package pool
+﻿package pool
 
 import (
 	"context"
@@ -12,11 +12,12 @@ import (
 
 const sqliteCols = "id, type, data, status, priority, batch_id, timeout_ms, max_retries, retries, scheduled_at, created_at, started_at, done_at, error, result, progress_current, progress_total"
 
+// sqliteBackend 将任务存储在 SQLite 数据库中。
 type sqliteBackend struct {
 	db     *sql.DB
 	cfg    Config
 	dsn    string
-	notify chan struct{}
+	notify chan struct{} // 唤醒阻塞的 Dequeue
 }
 
 func newSQLiteBackend(cfg Config) (Backend, error) {
@@ -38,7 +39,7 @@ func init() {
 func (b *sqliteBackend) Init(ctx context.Context) error {
 	db, err := sql.Open("sqlite", b.dsn)
 	if err != nil {
-		return fmt.Errorf("pool/sqlite: open: %w", err)
+		return fmt.Errorf("pool/sqlite: 打开数据库失败: %w", err)
 	}
 	b.db = db
 
@@ -64,7 +65,7 @@ func (b *sqliteBackend) Init(ctx context.Context) error {
 		)
 	`)
 	if err != nil {
-		return fmt.Errorf("pool/sqlite: create table: %w", err)
+		return fmt.Errorf("pool/sqlite: 创建表失败: %w", err)
 	}
 
 	db.Exec(`CREATE INDEX IF NOT EXISTS idx_tp_status ON taskpool_tasks(status)`)
@@ -183,6 +184,7 @@ func (b *sqliteBackend) dequeue(ctx context.Context, timeout time.Duration) (*Ta
 	}
 }
 
+// claimNextTask 选取优先级最高的待处理任务，并将其状态标记为"运行中"。
 func (b *sqliteBackend) claimNextTask() (*Task, error) {
 	now := time.Now().Format(time.RFC3339Nano)
 
@@ -305,10 +307,10 @@ type sqliteScanner interface {
 func (b *sqliteBackend) scanTask(s sqliteScanner) (*Task, error) {
 	t := &Task{}
 	var (
-		data, result, errStr            sql.NullString
+		data, result, errStr                     sql.NullString
 		status, priority, timeoutMs, maxRetries, retries int
-		progressCurr, progressTotal     int
-		scheduled, created, started, done sql.NullString
+		progressCurr, progressTotal              int
+		scheduled, created, started, done        sql.NullString
 	)
 	err := s.Scan(
 		&t.ID, &t.Type, &data, &status, &priority, &t.BatchID,
@@ -393,6 +395,7 @@ func (b *sqliteBackend) CancelBatch(batchID string) (int, error) {
 	return int(n), nil
 }
 
+// wakeUp 唤醒阻塞中的 Dequeue。
 func (b *sqliteBackend) wakeUp() {
 	select {
 	case b.notify <- struct{}{}:
