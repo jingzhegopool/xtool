@@ -307,10 +307,10 @@ type sqliteScanner interface {
 func (b *sqliteBackend) scanTask(s sqliteScanner) (*Task, error) {
 	t := &Task{}
 	var (
-		data, result, errStr                     sql.NullString
+		data, result, errStr                             sql.NullString
 		status, priority, timeoutMs, maxRetries, retries int
-		progressCurr, progressTotal              int
-		scheduled, created, started, done        sql.NullString
+		progressCurr, progressTotal                      int
+		scheduled, created, started, done                sql.NullString
 	)
 	err := s.Scan(
 		&t.ID, &t.Type, &data, &status, &priority, &t.BatchID,
