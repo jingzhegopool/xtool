@@ -63,11 +63,23 @@ type Task struct {
 	// 进度跟踪
 	ProgressCurrent int `json:"progress_current"`
 	ProgressTotal   int `json:"progress_total"`
+
+	// Metadata 是用户自定义的 JSON 数据，可用于存储业务字段（如 mall_id、shop_key、
+	// 断点恢复进度等）。由用户自行管理内容，xtool/pool 仅负责持久化和读取。
+	Metadata json.RawMessage `json:"metadata,omitempty"`
 }
 
 // Decode 将任务数据反序列化到给定的值中。
 func (t *Task) Decode(v any) error {
 	return json.Unmarshal(t.Data, v)
+}
+
+// DecodeMetadata 将 Metadata 反序列化到给定的值中。
+func (t *Task) DecodeMetadata(v any) error {
+	if len(t.Metadata) == 0 {
+		return nil
+	}
+	return json.Unmarshal(t.Metadata, v)
 }
 
 // TaskResult 在批次完成回调中返回已完成任务的结果。

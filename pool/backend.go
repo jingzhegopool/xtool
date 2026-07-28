@@ -2,6 +2,7 @@
 
 import (
 	"context"
+	"encoding/json"
 	"time"
 )
 
@@ -10,6 +11,10 @@ import (
 type Backend interface {
 	// Init 打开/创建存储后端，并在需要时自动创建表结构。
 	Init(ctx context.Context) error
+
+	// Recover 在启动时调用，将上次崩溃遗留的 StatusRunning 任务重置为 StatusPending。
+	// 保留 metadata 和进度数据，使 Handler 可从中断处继续。
+	Recover(ctx context.Context) error
 
 	// Close 清理后端资源。
 	Close() error
@@ -48,6 +53,9 @@ type Backend interface {
 	// UpdateResult 设置已完成任务的结果。
 	UpdateResult(id string, result []byte) error
 
+	// UpdateMetadata 更新任务的用户自定义 metadata。
+	UpdateMetadata(id string, metadata json.RawMessage) error
+
 	// ListByBatchID 返回指定批次 ID 的所有任务。
 	ListByBatchID(batchID string) ([]*Task, error)
 
@@ -80,3 +88,4 @@ func newBackend(cfg Config) (Backend, error) {
 	}
 	return fn(cfg)
 }
+

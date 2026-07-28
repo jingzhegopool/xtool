@@ -10,7 +10,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const sqliteCols = "id, type, data, status, priority, batch_id, timeout_ms, max_retries, retries, scheduled_at, created_at, started_at, done_at, error, result, progress_current, progress_total"
+const sqliteCols = "id, type, data, status, priority, batch_id, timeout_ms, max_retries, retries, scheduled_at, created_at, started_at, done_at, error, result, progress_current, progress_total, metadata"
 
 // sqliteBackend 将任务存储在 SQLite 数据库中。
 type sqliteBackend struct {
@@ -61,7 +61,8 @@ func (b *sqliteBackend) Init(ctx context.Context) error {
 			error         TEXT DEFAULT '',
 			result        TEXT,
 			progress_current INTEGER NOT NULL DEFAULT 0,
-			progress_total   INTEGER NOT NULL DEFAULT 0
+			progress_total   INTEGER NOT NULL DEFAULT 0,
+			metadata      TEXT
 		)
 	`)
 	if err != nil {
@@ -88,12 +89,12 @@ func (b *sqliteBackend) Save(task *Task) error {
 		task.CreatedAt = time.Now()
 	}
 	_, err := b.db.Exec(
-		`INSERT INTO taskpool_tasks (`+sqliteCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		`INSERT INTO taskpool_tasks (`+sqliteCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		task.ID, task.Type, string(task.Data), task.Status, task.Priority, task.BatchID,
 		int(task.Timeout.Milliseconds()), task.MaxRetries, task.Retries,
 		sqltime(task.ScheduledAt), sqltime(task.CreatedAt),
 		sqltime(zeroTime(task.StartedAt)), sqltime(zeroTime(task.DoneAt)),
-		task.Error, string(task.Result), task.ProgressCurrent, task.ProgressTotal,
+		task.Error, string(task.Result), task.ProgressCurrent, task.ProgressTotal, string(task.Metadata),
 	)
 	return err
 }
@@ -307,7 +308,7 @@ type sqliteScanner interface {
 func (b *sqliteBackend) scanTask(s sqliteScanner) (*Task, error) {
 	t := &Task{}
 	var (
-		data, result, errStr                             sql.NullString
+		data, result, errStr, meta                 sql.NullString
 		status, priority, timeoutMs, maxRetries, retries int
 		progressCurr, progressTotal                      int
 		scheduled, created, started, done                sql.NullString
@@ -317,6 +318,7 @@ func (b *sqliteBackend) scanTask(s sqliteScanner) (*Task, error) {
 		&timeoutMs, &maxRetries, &retries,
 		&scheduled, &created, &started, &done,
 		&errStr, &result, &progressCurr, &progressTotal,
+		&meta,
 	)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -341,6 +343,9 @@ func (b *sqliteBackend) scanTask(s sqliteScanner) (*Task, error) {
 	t.Error = errStr.String
 	t.CreatedAt = parseTime(created.String)
 	t.ScheduledAt = parseTime(scheduled.String)
+	if meta.Valid {
+		t.Metadata = json.RawMessage(meta.String)
+	}
 	if started.Valid {
 		pt := parseTime(started.String)
 		t.StartedAt = &pt
@@ -395,6 +400,18 @@ func (b *sqliteBackend) CancelBatch(batchID string) (int, error) {
 	return int(n), nil
 }
 
+func (b *sqliteBackend) Recover(ctx context.Context) error {
+	// 将上次崩溃遗留的 StatusRunning(2) 任务重置为 StatusPending(0)
+	_, err := b.db.Exec(
+		`UPDATE taskpool_tasks SET status = 0, started_at = NULL, error = '' WHERE status = 2`,
+	)
+	return err
+}
+
+func (b *sqliteBackend) UpdateMetadata(id string, metadata json.RawMessage) error {
+	_, err := b.db.Exec(`UPDATE taskpool_tasks SET metadata=? WHERE id=?`, string(metadata), id)
+	return err
+}
 // wakeUp 唤醒阻塞中的 Dequeue。
 func (b *sqliteBackend) wakeUp() {
 	select {
@@ -402,3 +419,4 @@ func (b *sqliteBackend) wakeUp() {
 	default:
 	}
 }
+

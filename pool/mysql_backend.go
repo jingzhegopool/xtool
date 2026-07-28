@@ -65,6 +65,7 @@ func (b *mysqlBackend) Init(ctx context.Context) error {
 			result        LONGTEXT,
 			progress_current INT NOT NULL DEFAULT 0,
 			progress_total   INT NOT NULL DEFAULT 0,
+			metadata      LONGTEXT,
 			INDEX idx_status (status),
 			INDEX idx_batch (batch_id),
 			INDEX idx_scheduled (scheduled_at)
@@ -92,12 +93,12 @@ func (b *mysqlBackend) Save(task *Task) error {
 	}
 
 	_, err := b.db.Exec(
-		`INSERT INTO taskpool_tasks (id, type, data, status, priority, batch_id, timeout_ms, max_retries, retries, scheduled_at, created_at, error, progress_current, progress_total)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO taskpool_tasks (id, type, data, status, priority, batch_id, timeout_ms, max_retries, retries, scheduled_at, created_at, error, progress_current, progress_total, metadata)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		task.ID, task.Type, string(task.Data), task.Status, task.Priority, task.BatchID,
 		int(task.Timeout.Milliseconds()), task.MaxRetries, task.Retries,
 		nullTime(task.ScheduledAt), task.CreatedAt, task.Error,
-		task.ProgressCurrent, task.ProgressTotal,
+		task.ProgressCurrent, task.ProgressTotal, string(task.Metadata),
 	)
 	return err
 }
@@ -109,7 +110,7 @@ func nullTime(t time.Time) *time.Time {
 	return &t
 }
 
-const mysqlSelectCols = `id, type, COALESCE(data,''), status, priority, COALESCE(batch_id,''), timeout_ms, max_retries, retries, scheduled_at, created_at, started_at, done_at, COALESCE(error,''), COALESCE(result,''), progress_current, progress_total`
+const mysqlSelectCols = `id, type, COALESCE(data,''), status, priority, COALESCE(batch_id,''), timeout_ms, max_retries, retries, scheduled_at, created_at, started_at, done_at, COALESCE(error,''), COALESCE(result,''), progress_current, progress_total, metadata`
 
 func (b *mysqlBackend) Get(id string) (*Task, error) {
 	row := b.db.QueryRow(`SELECT `+mysqlSelectCols+` FROM taskpool_tasks WHERE id = ?`, id)
@@ -343,6 +344,17 @@ func (b *mysqlBackend) CancelBatch(batchID string) (int, error) {
 	return int(affected), nil
 }
 
+func (b *mysqlBackend) Recover(ctx context.Context) error {
+	_, err := b.db.Exec(
+		`UPDATE taskpool_tasks SET status = 0, started_at = NULL, error = '' WHERE status = 2`,
+	)
+	return err
+}
+
+func (b *mysqlBackend) UpdateMetadata(id string, metadata json.RawMessage) error {
+	_, err := b.db.Exec(`UPDATE taskpool_tasks SET metadata=? WHERE id=?`, string(metadata), id)
+	return err
+}
 func (b *mysqlBackend) wakeUp() {
 	select {
 	case b.notify <- struct{}{}:
@@ -363,12 +375,14 @@ func (b *mysqlBackend) scanTask(s mysqlScanner) (*Task, error) {
 		status, priority, timeoutMs, maxRetries, retries int
 		progressCurr, progressTotal int
 		scheduled, created, started, done sql.NullTime
+		meta sql.NullString
 	)
 	err := s.Scan(
 		&t.ID, &t.Type, &data, &status, &priority, &t.BatchID,
 		&timeoutMs, &maxRetries, &retries,
 		&scheduled, &created, &started, &done,
 		&errStr, &result, &progressCurr, &progressTotal,
+		&meta,
 	)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -415,3 +429,5 @@ func (b *mysqlBackend) scanTasks(rows *sql.Rows) ([]*Task, error) {
 	}
 	return tasks, rows.Err()
 }
+
+

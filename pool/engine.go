@@ -63,6 +63,12 @@ func New(cfg ...Config) (*TaskPool, error) {
 		return nil, err
 	}
 
+	// 启动时恢复：重置上次崩溃遗留的 Running 任务，保留 metadata 和进度数据
+	// Handler 可通过检查 task.ProgressCurrent 和 task.Metadata 实现断点续做
+	if err := p.backend.Recover(context.Background()); err != nil {
+		return nil, fmt.Errorf("pool: 恢复失败: %w", err)
+	}
+
 	p.ctx, p.cancel = context.WithCancel(context.Background())
 
 	// 启动工作协程
@@ -214,6 +220,12 @@ func (p *TaskPool) Backend() Backend {
 	return p.backend
 }
 
+// SaveTaskMetadata 更新任务的 metadata（用户自定义数据）。
+// 可用于持久化 checkpoint 信息，支持崩溃后断点续做。
+// 等价于 backend.UpdateMetadata()。
+func (p *TaskPool) SaveTaskMetadata(id string, metadata json.RawMessage) error {
+	return p.backend.UpdateMetadata(id, metadata)
+}
 // ------- 回调注册 -------
 
 // OnProgress 注册任务进度更新回调。
@@ -509,3 +521,4 @@ func marshalAny(v any) json.RawMessage {
 	}
 	return json.RawMessage(b)
 }
+

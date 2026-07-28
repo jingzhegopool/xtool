@@ -3,6 +3,7 @@
 import (
 	"container/heap"
 	"context"
+	"encoding/json"
 	"sync"
 	"time"
 )
@@ -388,3 +389,32 @@ func (h *memHeapItems) Pop() any {
 	*h = old[:n-1]
 	return item
 }
+
+
+// Recover 内存后端不需要恢复，数据已在进程重启时丢失。
+func (m *memoryBackend) Recover(ctx context.Context) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	// 将 running 任务重置为 pending
+	for _, t := range m.tasks {
+		if t.Status == StatusRunning || t.Status == StatusRetrying {
+			t.Status = StatusPending
+			t.StartedAt = nil
+			t.Error = ""
+		}
+	}
+	return nil
+}
+
+// UpdateMetadata 更新任务的 metadata。
+func (m *memoryBackend) UpdateMetadata(id string, metadata json.RawMessage) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if t, ok := m.tasks[id]; ok {
+		t.Metadata = metadata
+	}
+	return nil
+}
+
+
+
