@@ -1,4 +1,4 @@
-﻿// Package pool 提供通用任务池，支持可插拔的存储后端。
+// Package pool 提供通用任务池，支持可插拔的存储后端。
 //
 // 支持的后端：memory（内存）、sqlite（SQLite）、mysql（MySQL）。
 // 执行模式：parallel（并发）或 sequential（串行），由 MaxWorkers 控制。
@@ -6,8 +6,8 @@
 // 快速开始：
 //
 //	p, _ := pool.New(pool.Config{
-//	    Backend: "memory",
-//	    Mode:    "parallel",
+//	    Backend:    "memory",
+//	    Mode:       "parallel",
 //	    MaxWorkers: 5,
 //	})
 //	defer p.Stop()
@@ -33,7 +33,12 @@
 //	// 统计和进度
 //	stats, _ := p.Stats()
 //	progress := p.Progress()
+//	metrics := p.Metrics()
+//
+//	// 类型级并发限流
+//	p.Handle("offline", handler, pool.WithConcurrency(2))
+//	p.Handle("batch_verify", batchHandler, pool.WithConcurrency(1))
 package pool
 
 // Version 是 pool 包的当前版本号。
-const Version = "0.2.0"
+const Version = "0.3.0"

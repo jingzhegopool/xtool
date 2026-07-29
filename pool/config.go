@@ -46,6 +46,12 @@ type Config struct {
 
 	// BatchCompleteCallback 若为 true，则当批次内所有任务完成时触发 OnBatchComplete 回调。
 	BatchCompleteCallback bool `json:"batch_complete_callback"`
+
+	// ProgressThrottle 是 SetProgress 写入数据库的最小间隔。
+	// 为 0 时每次 SetProgress 都写入（行为不变）。
+	// 设为非零值（如 100ms）后，同一任务 ID 在该间隔内的多次进度更新
+	// 会合并为最后的值写入一次，减少高频场景下的磁盘压力。
+	ProgressThrottle time.Duration `json:"progress_throttle"`
 }
 
 func defaultConfig() Config {
@@ -58,6 +64,7 @@ func defaultConfig() Config {
 		PollInterval:         200 * time.Millisecond,
 		MaxQueueSize:         100000,
 		BatchCompleteCallback: true,
+		ProgressThrottle:     0,
 	}
 }
 
@@ -88,6 +95,9 @@ func applyConfig(def Config, user Config) Config {
 	}
 	if user.MaxQueueSize > 0 {
 		def.MaxQueueSize = user.MaxQueueSize
+	}
+	if user.ProgressThrottle > 0 {
+		def.ProgressThrottle = user.ProgressThrottle
 	}
 	// 串行模式强制 MaxWorkers = 1
 	if def.Mode == "sequential" {

@@ -13,12 +13,47 @@ import (
 // Handler 是用户注册的处理任务的函数类型。
 type Handler func(ctx context.Context, task *Task) (any, error)
 
+// HandlerOption 配置 Handler 注册时的选项。
+type HandlerOption struct {
+	apply func(*handlerConfig)
+}
+
+type handlerConfig struct {
+	concurrency int // 0 = 不限制
+}
+
+// WithConcurrency 限制该任务类型的最大并发执行数。
+// 例如 WithConcurrency(2) 表示同一时刻最多 2 个该类型的任务在跑。
+// 0 或不设置表示不限制（共享全局 MaxWorkers）。
+func WithConcurrency(n int) HandlerOption {
+	if n <= 0 {
+		n = 0
+	}
+	return HandlerOption{apply: func(c *handlerConfig) {
+		c.concurrency = n
+	}}
+}
+
+// batchCounter 跟踪一个批次的任务完成情况。
+type batchCounter struct {
+	mu    sync.Mutex
+	total int
+	done  int
+}
+
 // TaskPool 是面向用户的任务池，带可插拔的后端。
 type TaskPool struct {
 	cfg      Config
 	backend  Backend
 	handlers map[string]Handler
 	mu       sync.Mutex
+
+	// 类型级并发控制
+	handlerSemaphores map[string]chan struct{}
+
+	// 批次计数器
+	batchCounters map[string]*batchCounter
+	batchMu       sync.Mutex
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -29,7 +64,7 @@ type TaskPool struct {
 		tasksFailed atomic.Int64
 	}
 
-	progress   map[string][2]int // taskID => [current, total]
+	progress   map[string]*progressEntry
 	progressMu sync.RWMutex
 
 	onStart         func(*Task)
@@ -39,6 +74,7 @@ type TaskPool struct {
 	onBatchComplete func(string, []*TaskResult)
 
 	started atomic.Bool
+	metrics *Metrics
 }
 
 // New 创建一个任务池，使用给定的配置。
@@ -50,9 +86,12 @@ func New(cfg ...Config) (*TaskPool, error) {
 	}
 
 	p := &TaskPool{
-		cfg:      c,
-		handlers: make(map[string]Handler),
-		progress: make(map[string][2]int),
+		cfg:               c,
+		handlers:          make(map[string]Handler),
+		handlerSemaphores: make(map[string]chan struct{}),
+		progress:          make(map[string]*progressEntry),
+		batchCounters:     make(map[string]*batchCounter),
+		metrics:           newMetrics(),
 	}
 
 	var err error
@@ -82,10 +121,13 @@ func NewWithBackend(b Backend, cfg ...Config) (*TaskPool, error) {
 	}
 
 	p := &TaskPool{
-		cfg:      c,
-		backend:  b,
-		handlers: make(map[string]Handler),
-		progress: make(map[string][2]int),
+		cfg:               c,
+		backend:           b,
+		handlers:          make(map[string]Handler),
+		handlerSemaphores: make(map[string]chan struct{}),
+		progress:          make(map[string]*progressEntry),
+		batchCounters:     make(map[string]*batchCounter),
+		metrics:           newMetrics(),
 	}
 
 	if err := p.init(); err != nil {
@@ -118,11 +160,8 @@ func (p *TaskPool) init() error {
 		go p.workerLoop()
 	}
 
-	// 启动批次完成检查协程
-	if p.cfg.BatchCompleteCallback {
-		p.wg.Add(1)
-		go p.batchChecker()
-	}
+	// 注意：batchChecker 已移除，改用计数器追踪（batchCounters）
+	// 任务完成时在 executeTask 末尾触发 checkBatchCompletion。
 
 	p.started.Store(true)
 	poolLogger().Debug("任务池工作协程已启动",
@@ -132,16 +171,32 @@ func (p *TaskPool) init() error {
 }
 
 // Handle 注册一个任务类型对应的处理函数。
-func (p *TaskPool) Handle(typ string, handler Handler) {
+// 可选传入 HandlerOption，如 WithConcurrency(n) 限制该类型的并发数。
+func (p *TaskPool) Handle(typ string, handler Handler, opts ...HandlerOption) {
+	cfg := handlerConfig{}
+	for _, opt := range opts {
+		opt.apply(&cfg)
+	}
+
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.handlers[typ] = handler
-	poolLogger().Debug("注册任务处理器", slog.String("type", typ))
+
+	if cfg.concurrency > 0 {
+		p.handlerSemaphores[typ] = make(chan struct{}, cfg.concurrency)
+		poolLogger().Debug("注册任务处理器（限流）",
+			slog.String("type", typ),
+			slog.Int("concurrency", cfg.concurrency),
+		)
+	} else {
+		delete(p.handlerSemaphores, typ)
+		poolLogger().Debug("注册任务处理器", slog.String("type", typ))
+	}
 }
 
 // HandleFunc 是 Handle 的便捷包装。
-func (p *TaskPool) HandleFunc(typ string, fn func(ctx context.Context, task *Task) (any, error)) {
-	p.Handle(typ, fn)
+func (p *TaskPool) HandleFunc(typ string, fn func(ctx context.Context, task *Task) (any, error), opts ...HandlerOption) {
+	p.Handle(typ, fn, opts...)
 }
 
 // Submit 提交一个新任务到队列，并返回其 ID。
@@ -175,6 +230,12 @@ func (p *TaskPool) Submit(typ string, data any, opts ...SubmitOption) (string, e
 		)
 		return "", err
 	}
+
+	if p.metrics != nil {
+		p.metrics.incSubmitted(typ)
+		p.trackBatchSubmit(task)
+	}
+
 	poolLogger().Info("任务已提交",
 		slog.String("id", task.ID),
 		slog.String("type", task.Type),
@@ -210,12 +271,34 @@ func (p *TaskPool) SubmitTask(task *Task) error {
 		)
 		return err
 	}
+
+	if p.metrics != nil {
+		p.metrics.incSubmitted(task.Type)
+		p.trackBatchSubmit(task)
+	}
+
 	poolLogger().Info("任务已提交",
 		slog.String("id", task.ID),
 		slog.String("type", task.Type),
 		slog.String("status", task.Status.String()),
 	)
 	return nil
+}
+
+// trackBatchSubmit 记录批次计数器。
+func (p *TaskPool) trackBatchSubmit(task *Task) {
+	if task.BatchID == "" || !p.cfg.BatchCompleteCallback {
+		return
+	}
+	p.batchMu.Lock()
+	bc, ok := p.batchCounters[task.BatchID]
+	if !ok {
+		bc = &batchCounter{total: 1}
+		p.batchCounters[task.BatchID] = bc
+	} else {
+		bc.total++
+	}
+	p.batchMu.Unlock()
 }
 
 // Stop 优雅地关闭任务池：
@@ -269,18 +352,6 @@ func (p *TaskPool) Stats() (map[TaskStatus]int, error) {
 	return p.backend.CountByStatus()
 }
 
-// Progress 返回所有任务的进度快照。
-// Key 为任务 ID，value 为 [当前进度, 总进度]。
-func (p *TaskPool) Progress() map[string][2]int {
-	p.progressMu.RLock()
-	defer p.progressMu.RUnlock()
-	result := make(map[string][2]int, len(p.progress))
-	for k, v := range p.progress {
-		result[k] = v
-	}
-	return result
-}
-
 // Tasks 返回分页的任务列表。
 func (p *TaskPool) Tasks(limit, offset int) ([]*Task, error) {
 	return p.backend.ListAll(limit, offset)
@@ -321,6 +392,15 @@ func (p *TaskPool) Backend() Backend {
 // 等价于 backend.UpdateMetadata()。
 func (p *TaskPool) SaveTaskMetadata(id string, metadata json.RawMessage) error {
 	return p.backend.UpdateMetadata(id, metadata)
+}
+
+// Metrics 返回当前运行时指标的原子快照。
+// 可用于监控面板、调试端点或日志输出。
+func (p *TaskPool) Metrics() MetricsSnapshot {
+	if p.metrics == nil {
+		return MetricsSnapshot{TypeStats: make(map[string]TypeStats)}
+	}
+	return p.metrics.Snapshot()
 }
 
 // ------- 回调注册 -------
@@ -385,6 +465,8 @@ func (p *TaskPool) workerLoop() {
 func (p *TaskPool) executeTask(task *Task) {
 	p.mu.Lock()
 	handler, ok := p.handlers[task.Type]
+	// 获取类型级信号量
+	sem, hasSem := p.handlerSemaphores[task.Type]
 	// 在锁内获取回调引用
 	var onCompleteFn func(*Task)
 	var onFailedFn func(*Task, error)
@@ -398,9 +480,22 @@ func (p *TaskPool) executeTask(task *Task) {
 	if p.onFailed != nil {
 		onFailedFn = p.onFailed
 	}
-	onBatch := p.onBatchComplete
-	batchCfg := p.cfg.BatchCompleteCallback
 	p.mu.Unlock()
+
+	// 类型级并发控制：获取信号量
+	if hasSem {
+		select {
+		case sem <- struct{}{}:
+		case <-p.ctx.Done():
+			return
+		}
+		defer func() { <-sem }()
+	}
+
+	if p.metrics != nil {
+		p.metrics.addRunning(task.Type, 1)
+		defer p.metrics.addRunning(task.Type, -1)
+	}
 
 	poolLogger().Debug("开始执行任务",
 		slog.String("id", task.ID),
@@ -420,12 +515,16 @@ func (p *TaskPool) executeTask(task *Task) {
 		)
 		p.backend.UpdateStatus(task.ID, StatusFailed, "未知的任务类型: "+task.Type)
 		p.stats.tasksFailed.Add(1)
+		if p.metrics != nil {
+			p.metrics.incFailed(task.Type)
+		}
 		if onFailedFn != nil {
 			onFailedFn(task, ErrUnknownType)
 		}
-		p.checkBatchCompletion(task, onBatch, batchCfg)
+		p.checkBatchCompletion(task)
 		return
 	}
+
 
 	execCtx := p.ctx
 	var cancel context.CancelFunc
@@ -436,6 +535,7 @@ func (p *TaskPool) executeTask(task *Task) {
 
 	var result any
 	var execErr error
+	startTime := time.Now()
 
 	func() {
 		defer func() {
@@ -450,6 +550,11 @@ func (p *TaskPool) executeTask(task *Task) {
 		}()
 		result, execErr = handler(execCtx, task)
 	}()
+
+	elapsed := time.Since(startTime)
+	if p.metrics != nil {
+		p.metrics.addLatency(task.Type, elapsed)
+	}
 
 	now := time.Now()
 	task.DoneAt = &now
@@ -475,6 +580,9 @@ func (p *TaskPool) executeTask(task *Task) {
 				task.Error = "重试失败: " + err.Error()
 				p.backend.UpdateStatus(task.ID, StatusFailed, task.Error)
 				p.stats.tasksFailed.Add(1)
+				if p.metrics != nil {
+					p.metrics.incFailed(task.Type)
+				}
 				poolLogger().Error("任务重试入队失败",
 					slog.String("id", task.ID),
 					slog.String("type", task.Type),
@@ -491,6 +599,9 @@ func (p *TaskPool) executeTask(task *Task) {
 		task.Error = execErr.Error()
 		p.backend.UpdateStatus(task.ID, StatusFailed, task.Error)
 		p.stats.tasksFailed.Add(1)
+		if p.metrics != nil {
+			p.metrics.incFailed(task.Type)
+		}
 		poolLogger().Error("任务最终失败",
 			slog.String("id", task.ID),
 			slog.String("type", task.Type),
@@ -506,9 +617,13 @@ func (p *TaskPool) executeTask(task *Task) {
 		p.backend.UpdateResult(task.ID, []byte(resultBytes))
 		p.backend.UpdateStatus(task.ID, StatusCompleted, "")
 		p.stats.tasksDone.Add(1)
+		if p.metrics != nil {
+			p.metrics.incCompleted(task.Type)
+		}
 		poolLogger().Info("任务执行完成",
 			slog.String("id", task.ID),
 			slog.String("type", task.Type),
+			slog.Duration("elapsed", elapsed),
 		)
 		if onCompleteFn != nil {
 			task.Result = resultBytes
@@ -516,15 +631,40 @@ func (p *TaskPool) executeTask(task *Task) {
 		}
 	}
 
-	p.checkBatchCompletion(task, onBatch, batchCfg)
+	p.checkBatchCompletion(task)
 }
 
 // checkBatchCompletion 检查批次中的所有任务是否都已完成。
-func (p *TaskPool) checkBatchCompletion(task *Task, callback func(string, []*TaskResult), enabled bool) {
-	if !enabled || task.BatchID == "" || callback == nil {
+// 使用计数器追踪，O(1) 复杂度，无需扫描数据库。
+func (p *TaskPool) checkBatchCompletion(task *Task) {
+	if !p.cfg.BatchCompleteCallback || task.BatchID == "" {
 		return
 	}
 
+	p.mu.Lock()
+	callback := p.onBatchComplete
+	p.mu.Unlock()
+
+	if callback == nil {
+		return
+	}
+
+	// 计数器递减
+	p.batchMu.Lock()
+	bc, ok := p.batchCounters[task.BatchID]
+	if !ok {
+		p.batchMu.Unlock()
+		return
+	}
+	bc.done++
+	remaining := bc.total - bc.done
+	p.batchMu.Unlock()
+
+	if remaining > 0 {
+		return
+	}
+
+	// 所有任务完成，获取结果并触发回调
 	tasks, err := p.backend.ListByBatchID(task.BatchID)
 	if err != nil {
 		poolLogger().Error("查询批次任务失败",
@@ -533,116 +673,22 @@ func (p *TaskPool) checkBatchCompletion(task *Task, callback func(string, []*Tas
 		)
 		return
 	}
-
-	// 检查所有任务是否都处于终态
-	allDone := len(tasks) > 0
-	for _, t := range tasks {
-		if t.Status != StatusCompleted && t.Status != StatusFailed && t.Status != StatusCancelled {
-			allDone = false
-			break
-		}
-	}
-
-	if allDone {
-		poolLogger().Info("批次全部完成",
-			slog.String("batch_id", task.BatchID),
-			slog.Int("count", len(tasks)),
-		)
-		results := make([]*TaskResult, len(tasks))
-		for i, t := range tasks {
-			results[i] = &TaskResult{
-				ID:     t.ID,
-				Status: t.Status,
-				Data:   t.Data,
-				Result: t.Result,
-				Error:  t.Error,
-			}
-		}
-		callback(task.BatchID, results)
-	}
-}
-
-// batchChecker 定期扫描批次完成状态。
-// 对内存后端是必需的（没有数据库级触发器）。
-// 对 SQLite/MySQL 是冗余但无害的。
-func (p *TaskPool) batchChecker() {
-	defer p.wg.Done()
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-p.ctx.Done():
-			return
-		case <-ticker.C:
-			p.scanBatches()
-		}
-	}
-}
-
-func (p *TaskPool) scanBatches() {
-	tasks, err := p.backend.ListAll(1000, 0)
-	if err != nil {
-		poolLogger().Error("扫描批次失败", slog.String("error", err.Error()))
+	if len(tasks) == 0 {
 		return
 	}
 
-	type batchState struct {
-		allDone bool
-		results []*TaskResult
-		checked bool
-	}
-	batches := make(map[string]*batchState)
-
-	for _, t := range tasks {
-		if t.BatchID == "" {
-			continue
-		}
-		if _, ok := batches[t.BatchID]; !ok {
-			batches[t.BatchID] = &batchState{allDone: true}
-		}
-		if t.Status == StatusPending || t.Status == StatusRunning || t.Status == StatusDelayed || t.Status == StatusRetrying {
-			batches[t.BatchID].allDone = false
+	poolLogger().Info("批次全部完成",
+		slog.String("batch_id", task.BatchID),
+		slog.Int("count", len(tasks)),
+	)
+	results := make([]*TaskResult, len(tasks))
+	for i, t := range tasks {
+		results[i] = &TaskResult{
+			ID: t.ID, Status: t.Status,
+			Data: t.Data, Result: t.Result, Error: t.Error,
 		}
 	}
-
-	for batchID, state := range batches {
-		if !state.allDone {
-			continue
-		}
-
-		batchTasks, err := p.backend.ListByBatchID(batchID)
-		if err != nil {
-			poolLogger().Error("扫描批次查询失败",
-				slog.String("batch_id", batchID),
-				slog.String("error", err.Error()),
-			)
-			continue
-		}
-		if len(batchTasks) == 0 {
-			continue
-		}
-
-		results := make([]*TaskResult, len(batchTasks))
-		for i, t := range batchTasks {
-			results[i] = &TaskResult{
-				ID: t.ID, Status: t.Status,
-				Data: t.Data, Result: t.Result, Error: t.Error,
-			}
-		}
-
-		p.mu.Lock()
-		fn := p.onBatchComplete
-		p.mu.Unlock()
-
-		if fn != nil {
-			poolLogger().Info("扫描发现批次完成",
-				slog.String("batch_id", batchID),
-				slog.Int("count", len(batchTasks)),
-			)
-			go fn(batchID, results)
-		}
-	}
+	callback(task.BatchID, results)
 }
 
 // ------- 提交选项 -------
