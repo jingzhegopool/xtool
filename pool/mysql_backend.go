@@ -152,9 +152,12 @@ func (b *mysqlBackend) Enqueue(task *Task) error {
 		return err
 	}
 	if existing != nil {
+		// 已存在：完整同步调度字段（Start/Continue 重新激活时清理历史执行痕迹）
 		_, err = b.db.Exec(
-			`UPDATE taskpool_tasks SET status=?, priority=?, scheduled_at=? WHERE id=?`,
-			task.Status, task.Priority, nullTime(task.ScheduledAt), task.ID,
+			`UPDATE taskpool_tasks SET status=?, priority=?, scheduled_at=?, started_at=?, done_at=?, error=?, retries=? WHERE id=?`,
+			task.Status, task.Priority, nullTime(task.ScheduledAt),
+			nullTime(zeroTime(task.StartedAt)), nullTime(zeroTime(task.DoneAt)),
+			task.Error, task.Retries, task.ID,
 		)
 		if err != nil {
 			poolLogger().Error("MySQL 更新任务入队失败",

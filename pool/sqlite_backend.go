@@ -162,9 +162,12 @@ func (b *sqliteBackend) Enqueue(task *Task) error {
 			return err
 		}
 	} else {
+		// 已存在：完整同步调度字段（Start/Continue 重新激活时清理历史执行痕迹）
 		_, err = b.db.Exec(
-			`UPDATE taskpool_tasks SET status=?, priority=?, scheduled_at=? WHERE id=?`,
-			task.Status, task.Priority, sqltime(task.ScheduledAt), task.ID,
+			`UPDATE taskpool_tasks SET status=?, priority=?, scheduled_at=?, started_at=?, done_at=?, error=?, retries=? WHERE id=?`,
+			task.Status, task.Priority, sqltime(task.ScheduledAt),
+			sqltime(zeroTime(task.StartedAt)), sqltime(zeroTime(task.DoneAt)),
+			task.Error, task.Retries, task.ID,
 		)
 		if err != nil {
 			poolLogger().Error("SQLite 更新任务入队失败",

@@ -35,10 +35,17 @@
 //	progress := p.Progress()
 //	metrics := p.Metrics()
 //
+//	// 任务级控制（v0.4.0）：启动/停止/继续/终止/移除
+//	p.Start(id)       // 启动延迟任务 / 重新激活失败、取消、暂停的任务
+//	p.StopTask(id)    // 停止运行中任务（排空当前小任务，保留进度，可恢复）
+//	p.Continue(id)    // 继续执行已停止的任务
+//	p.Terminate(id)   // 终止任务（终态 cancelled）
+//	p.Remove(id)      // 移除任务（仅限已停止/非运行中）
+//
 //	// 类型级并发限流
 //	p.Handle("offline", handler, pool.WithConcurrency(2))
 //	p.Handle("batch_verify", batchHandler, pool.WithConcurrency(1))
 package pool
 
 // Version 是 pool 包的当前版本号。
-const Version = "0.3.0"
+const Version = "0.4.0"

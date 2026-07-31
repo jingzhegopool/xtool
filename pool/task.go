@@ -16,6 +16,7 @@ const (
 	StatusFailed                      // 4 - 执行失败（无更多重试机会）
 	StatusCancelled                   // 5 - 已取消
 	StatusRetrying                    // 6 - 失败，但将重试
+	StatusPaused                      // 7 - 手动暂停，可恢复
 )
 
 func (s TaskStatus) String() string {
@@ -34,6 +35,8 @@ func (s TaskStatus) String() string {
 		return "cancelled"
 	case StatusRetrying:
 		return "retrying"
+	case StatusPaused:
+		return "paused"
 	default:
 		return "unknown"
 	}

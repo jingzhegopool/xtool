@@ -16,8 +16,9 @@ type memoryBackend struct {
 	items    memHeapItems
 	cap      int
 	closed   bool
-	wait     chan struct{} // 入队信号，用于阻塞 Dequeue
+	wait     chan struct{}     // 入队信号，用于阻塞 Dequeue
 	progress map[string][2]int // id => [current, total]
+	inQueue  map[string]bool   // 已在堆中的任务 id（防重复入队，Start 重复调用安全）
 }
 
 func newMemoryBackend(cfg Config) (Backend, error) {
@@ -31,6 +32,7 @@ func newMemoryBackend(cfg Config) (Backend, error) {
 		cap:      cap,
 		wait:     make(chan struct{}),
 		progress: make(map[string][2]int),
+		inQueue:  make(map[string]bool),
 	}, nil
 }
 
@@ -55,7 +57,7 @@ func (m *memoryBackend) Save(task *Task) error {
 	if task.ID == "" {
 		task.ID = newID()
 	}
-	m.tasks[task.ID] = task
+	m.tasks[task.ID] = cloneTask(task) // 存副本，调用者对象与 map 完全隔离
 	poolLogger().Debug("内存后端保存任务",
 		slog.String("id", task.ID),
 		slog.String("type", task.Type),
@@ -70,7 +72,7 @@ func (m *memoryBackend) Get(id string) (*Task, error) {
 	if !ok {
 		return nil, ErrTaskNotFound
 	}
-	return t, nil
+	return cloneTask(t), nil
 }
 
 func (m *memoryBackend) Delete(id string) error {
@@ -78,6 +80,7 @@ func (m *memoryBackend) Delete(id string) error {
 	defer m.mu.Unlock()
 	delete(m.tasks, id)
 	delete(m.progress, id)
+	delete(m.inQueue, id)
 	return nil
 }
 
@@ -101,9 +104,24 @@ func (m *memoryBackend) Enqueue(task *Task) error {
 		return ErrQueueFull
 	}
 
-	m.tasks[task.ID] = task
+	m.tasks[task.ID] = cloneTask(task) // 存副本，调用者对象与 map 完全隔离
+
+	// 防重复入队：Start/Continue 重新激活时任务可能已在堆中，避免出现两份
+	// 同时同步最新状态（Start 可能已把 delayed 改为 pending、清空 ScheduledAt），
+	// 并唤醒阻塞中的 Dequeue（否则延迟任务提前执行时 worker 无人唤醒）
+	if m.inQueue[task.ID] {
+		m.tasks[task.ID] = cloneTask(task)
+		close(m.wait)
+		m.wait = make(chan struct{})
+		poolLogger().Debug("内存后端任务已在队列中，同步状态后跳过重复入队",
+			slog.String("id", task.ID),
+			slog.String("type", task.Type),
+		)
+		return nil
+	}
 
 	// 始终推入堆；Dequeue 会检查 ScheduledAt 和状态
+	m.inQueue[task.ID] = true
 	heap.Push(&m.items, &memItem{
 		id:       task.ID,
 		priority: task.Priority,
@@ -151,12 +169,13 @@ func (m *memoryBackend) dequeue(ctx context.Context, timeout time.Duration) (*Ta
 
 		if idx >= 0 {
 			item := heap.Remove(&m.items, idx).(*memItem)
+			delete(m.inQueue, item.id) // 出队后允许重新入队（Start 重新激活）
 			task := m.tasks[item.id]
 			task.Status = StatusRunning
 			now2 := time.Now()
 			task.StartedAt = &now2
 			m.mu.Unlock()
-			return task, nil
+			return cloneTask(task), nil // 返回副本，worker 的修改不影响 map 内对象
 		}
 
 		if m.closed {
@@ -236,6 +255,7 @@ func (m *memoryBackend) Remove(id string) bool {
 			break
 		}
 	}
+	delete(m.inQueue, id)
 
 	task.Status = StatusCancelled
 	return true
@@ -284,7 +304,7 @@ func (m *memoryBackend) ListByBatchID(batchID string) ([]*Task, error) {
 	var result []*Task
 	for _, t := range m.tasks {
 		if t.BatchID == batchID {
-			result = append(result, t)
+			result = append(result, cloneTask(t))
 		}
 	}
 	return result, nil
@@ -296,7 +316,7 @@ func (m *memoryBackend) ListByStatus(status TaskStatus, limit, offset int) ([]*T
 	var result []*Task
 	for _, t := range m.tasks {
 		if t.Status == status {
-			result = append(result, t)
+			result = append(result, cloneTask(t))
 		}
 	}
 	// 简单分页（不保证排序）
@@ -318,7 +338,7 @@ func (m *memoryBackend) ListAll(limit, offset int) ([]*Task, error) {
 	defer m.mu.Unlock()
 	var result []*Task
 	for _, t := range m.tasks {
-		result = append(result, t)
+		result = append(result, cloneTask(t))
 	}
 	if offset >= len(result) {
 		return nil, nil
@@ -376,10 +396,39 @@ func (m *memoryBackend) CancelBatch(batchID string) (int, error) {
 	}
 	heap.Init(&remaining)
 	m.items = remaining
+	m.inQueue = make(map[string]bool)
+	for _, item := range m.items {
+		m.inQueue[item.id] = true
+	}
 	return cancelled, nil
 }
 
 // ------- 堆元素 -------
+
+// cloneTask 深拷贝一个任务，返回独立副本。
+// memory 后端对外一律返回副本，map 内对象只在带锁的后端方法内修改，避免并发读写竞争。
+func cloneTask(t *Task) *Task {
+	c := *t // 浅拷贝（标量字段 + 指针字段）
+	// 深拷贝切片字段，避免共享底层数组
+	if t.Data != nil {
+		c.Data = append(json.RawMessage(nil), t.Data...)
+	}
+	if t.Result != nil {
+		c.Result = append(json.RawMessage(nil), t.Result...)
+	}
+	if t.Metadata != nil {
+		c.Metadata = append(json.RawMessage(nil), t.Metadata...)
+	}
+	if t.StartedAt != nil {
+		v := *t.StartedAt
+		c.StartedAt = &v
+	}
+	if t.DoneAt != nil {
+		v := *t.DoneAt
+		c.DoneAt = &v
+	}
+	return &c
+}
 
 // memItem 是内存优先队列堆中的元素。
 type memItem struct {

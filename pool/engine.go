@@ -59,6 +59,11 @@ type TaskPool struct {
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 
+	// 运行中任务的取消注册表 + 干预信号（Stop/Terminate 用）
+	controlMu      sync.Mutex
+	runningCancels map[string]context.CancelFunc // id => cancel()，仅运行中任务存在
+	stopSignals    map[string]TaskStatus         // id => 期望终态（StatusPaused / StatusCancelled）
+
 	stats struct {
 		tasksDone   atomic.Int64
 		tasksFailed atomic.Int64
@@ -91,6 +96,8 @@ func New(cfg ...Config) (*TaskPool, error) {
 		handlerSemaphores: make(map[string]chan struct{}),
 		progress:          make(map[string]*progressEntry),
 		batchCounters:     make(map[string]*batchCounter),
+		runningCancels:    make(map[string]context.CancelFunc),
+		stopSignals:       make(map[string]TaskStatus),
 		metrics:           newMetrics(),
 	}
 
@@ -127,6 +134,8 @@ func NewWithBackend(b Backend, cfg ...Config) (*TaskPool, error) {
 		handlerSemaphores: make(map[string]chan struct{}),
 		progress:          make(map[string]*progressEntry),
 		batchCounters:     make(map[string]*batchCounter),
+		runningCancels:    make(map[string]context.CancelFunc),
+		stopSignals:       make(map[string]TaskStatus),
 		metrics:           newMetrics(),
 	}
 
@@ -319,15 +328,136 @@ func (p *TaskPool) Stop() {
 	}
 }
 
-// Cancel 按 ID 取消一个待处理的任务。
+// Cancel 取消一个任务（兼容旧版，返回是否成功取消）。
+// 排队中的任务（pending/delayed）直接标记为 cancelled；
+// 运行中的任务发送取消信号，handler 响应 ctx.Done() 后终态为 cancelled。
+// 旧版仅支持排队中任务，本版升级为全状态支持。
 func (p *TaskPool) Cancel(id string) bool {
-	ok := p.backend.Remove(id)
+	return p.Terminate(id) == nil
+}
+
+// Terminate 终止一个任务，终态为 cancelled（不可自动恢复，但可 Start 重新激活）。
+// - 运行中：发送取消信号，handler 退出后写入 cancelled
+// - 排队中（pending/delayed）：直接标记为 cancelled
+// - 已完成/已失败/已暂停/已取消：返回错误（幂等调用可返回 ErrTaskNotRunning 之外的状态错误）
+func (p *TaskPool) Terminate(id string) error {
+	p.controlMu.Lock()
+	cancel, ok := p.runningCancels[id]
 	if ok {
-		poolLogger().Info("任务已取消", slog.String("id", id))
-	} else {
-		poolLogger().Warn("取消任务失败", slog.String("id", id))
+		p.stopSignals[id] = StatusCancelled
+		p.controlMu.Unlock()
+		cancel()
+		poolLogger().Info("任务终止信号已发送", slog.String("id", id))
+		return nil
 	}
-	return ok
+	p.controlMu.Unlock()
+
+	if p.backend.Remove(id) {
+		poolLogger().Info("任务已终止（排队中）", slog.String("id", id))
+		return nil
+	}
+
+	// 已停止的任务（paused/failed）：直接置为 cancelled（补刀，保证"终止按钮永远可用"）
+	task, err := p.backend.Get(id)
+	if err != nil {
+		return err
+	}
+	switch task.Status {
+	case StatusPaused, StatusFailed:
+		now := time.Now()
+		task.DoneAt = &now
+		if err := p.backend.UpdateStatus(id, StatusCancelled, "任务已终止"); err != nil {
+			return err
+		}
+		poolLogger().Info("任务已终止（已停止任务）", slog.String("id", id))
+		return nil
+	case StatusCompleted, StatusCancelled:
+		return fmt.Errorf("pool: 任务状态 %s 不可终止", task.Status)
+	default:
+		return fmt.Errorf("pool: 终止任务失败: 状态 %s", task.Status)
+	}
+}
+
+// StopTask 停止一个运行中的任务（暂停），保留进度和 metadata，可通过 Continue 恢复。
+// 停止语义（排空）：已经进入执行的小任务继续执行完成，但不再启动新的小任务——
+// 这依赖 handler 在“小任务之间”检查 ctx.Done()（见设计文档 §8）。
+// 若 handler 不响应 ctx.Done()，任务会继续运行到结束，但最终状态仍记为 paused，结果不落库。
+// 非运行中任务返回 ErrTaskNotRunning。
+func (p *TaskPool) StopTask(id string) error {
+	p.controlMu.Lock()
+	cancel, ok := p.runningCancels[id]
+	if ok {
+		p.stopSignals[id] = StatusPaused
+		p.controlMu.Unlock()
+		cancel()
+		poolLogger().Info("任务停止信号已发送", slog.String("id", id))
+		return nil
+	}
+	p.controlMu.Unlock()
+	return ErrTaskNotRunning
+}
+
+// Start 重新激活一个非活动任务，使其重新入队执行：
+// - delayed：立即执行（清除调度时间，改变主意场景）
+// - paused：继续执行（保留进度、metadata、重试计数）
+// - failed / cancelled：重新运行（重试计数清零）
+// 其他状态返回 ErrTaskNotStartable。
+func (p *TaskPool) Start(id string) error {
+	task, err := p.backend.Get(id)
+	if err != nil {
+		return err
+	}
+	switch task.Status {
+	case StatusDelayed, StatusPaused, StatusFailed, StatusCancelled:
+	default:
+		return ErrTaskNotStartable
+	}
+
+	if task.Status != StatusPaused {
+		task.Retries = 0 // 重新运行视为全新尝试
+	}
+	task.Status = StatusPending
+	task.ScheduledAt = time.Time{} // 延迟任务立即执行，清除调度时间
+	task.StartedAt = nil
+	task.DoneAt = nil
+	task.Error = ""
+	if err := p.backend.Enqueue(task); err != nil {
+		return err
+	}
+	poolLogger().Info("任务已重新激活",
+		slog.String("id", id),
+		slog.String("type", task.Type),
+	)
+	return nil
+}
+
+// Continue 继续执行一个已暂停的任务，等价于 Start，语义更明确。
+func (p *TaskPool) Continue(id string) error {
+	return p.Start(id)
+}
+
+// Remove 移除一个任务（从存储中彻底删除）。
+// 仅允许移除非运行中的任务：pending/delayed/paused/failed/cancelled/completed。
+// 运行中的任务必须先 StopTask（等变 paused）或 Terminate（等变 cancelled）后才能移除，
+// 对运行中任务调用返回 ErrTaskNotRemovable。
+func (p *TaskPool) Remove(id string) error {
+	task, err := p.backend.Get(id)
+	if err != nil {
+		return err
+	}
+	if task.Status == StatusRunning {
+		return ErrTaskNotRemovable
+	}
+	if err := p.backend.Delete(id); err != nil {
+		return err
+	}
+	poolLogger().Info("任务已移除", slog.String("id", id))
+	return nil
+}
+
+// DeleteTask 从存储中删除指定 ID 的任务（兼容旧版，等价于 Remove）。
+func (p *TaskPool) DeleteTask(id string) error {
+	return p.Remove(id)
 }
 
 // CancelBatch 取消指定批次中所有待处理的任务。
@@ -367,17 +497,14 @@ func (p *TaskPool) GetTask(id string) (*Task, error) {
 	return p.backend.Get(id)
 }
 
-// DeleteTask 从存储中删除指定 ID 的任务。
-func (p *TaskPool) DeleteTask(id string) error {
-	return p.backend.Delete(id)
-}
-
 // Pause 在 v0.2.0 中不支持。保留以供后续版本使用。
+// 注意：池级暂停（全局暂停所有任务）尚未实现；单任务暂停请使用 Stop(id)。
 func (p *TaskPool) Pause() {
 	// 空操作
 }
 
 // Resume 在 v0.2.0 中不支持。保留以供后续版本使用。
+// 注意：池级恢复尚未实现；单任务恢复请使用 Continue(id) 或 Start(id)。
 func (p *TaskPool) Resume() {
 	// 空操作
 }
@@ -508,6 +635,18 @@ func (p *TaskPool) executeTask(task *Task) {
 		onStartFn(task)
 	}
 
+	// ===== 任务级取消上下文：注册到取消注册表，供 Stop/Terminate 查找 =====
+	execCtx, taskCancel := context.WithCancel(p.ctx)
+	p.controlMu.Lock()
+	p.runningCancels[task.ID] = taskCancel
+	p.controlMu.Unlock()
+	defer func() {
+		p.controlMu.Lock()
+		delete(p.runningCancels, task.ID)
+		p.controlMu.Unlock()
+		taskCancel()
+	}()
+
 	if !ok {
 		poolLogger().Error("未知任务类型",
 			slog.String("id", task.ID),
@@ -525,12 +664,13 @@ func (p *TaskPool) executeTask(task *Task) {
 		return
 	}
 
-
-	execCtx := p.ctx
-	var cancel context.CancelFunc
+	// 超时叠加在任务级取消之上（超时或手动取消任一触发，handler 都会收到 Done）
+	var timeoutCancel context.CancelFunc
 	if task.Timeout > 0 {
-		execCtx, cancel = context.WithTimeout(execCtx, task.Timeout)
-		defer cancel()
+		execCtx, timeoutCancel = context.WithTimeout(execCtx, task.Timeout)
+	}
+	if timeoutCancel != nil {
+		defer timeoutCancel()
 	}
 
 	var result any
@@ -554,6 +694,44 @@ func (p *TaskPool) executeTask(task *Task) {
 	elapsed := time.Since(startTime)
 	if p.metrics != nil {
 		p.metrics.addLatency(task.Type, elapsed)
+	}
+
+	// ===== 干预检查：必须在重试/失败/成功分支之前 =====
+	// 若 Stop/Terminate 发过信号，handler 返回后直接写期望终态，
+	// 否则 context.Canceled 会被当成普通失败触发重试。
+	p.controlMu.Lock()
+	desired, intervened := p.stopSignals[task.ID]
+	if intervened {
+		delete(p.stopSignals, task.ID)
+	}
+	p.controlMu.Unlock()
+
+	if intervened {
+		now := time.Now()
+		task.DoneAt = &now
+		if desired == StatusPaused {
+			// 强制落库最新进度，保证 Continue 后续跑不丢进度
+			p.progressMu.RLock()
+			entry, hasProg := p.progress[task.ID]
+			var cur, total int
+			if hasProg {
+				cur, total = entry.current, entry.total
+			}
+			p.progressMu.RUnlock()
+			if hasProg {
+				_ = p.backend.UpdateProgress(task.ID, cur, total)
+				task.ProgressCurrent, task.ProgressTotal = cur, total
+			}
+			task.Status = StatusPaused
+			_ = p.backend.UpdateStatus(task.ID, StatusPaused, "")
+			poolLogger().Info("任务已暂停", slog.String("id", task.ID))
+		} else {
+			task.Status = StatusCancelled
+			_ = p.backend.UpdateStatus(task.ID, StatusCancelled, "任务已终止")
+			poolLogger().Info("任务已终止", slog.String("id", task.ID))
+		}
+		p.checkBatchCompletion(task)
+		return
 	}
 
 	now := time.Now()
